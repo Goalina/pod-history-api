@@ -1,0 +1,130 @@
+# ============================================================
+# Pod 历史记录服务 — K8s 部署清单
+# 集群: openmerlin-guiyang-006
+# kubectl apply -f deploy.yaml
+# ============================================================
+
+# ── 1. 存储历史数据的专用 namespace ──────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: arc-history
+
+---
+# ── 2. 服务运行身份 ──────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-history-api
+  namespace: arc-history
+
+---
+# ── 3. 权限声明 ──────────────────────────────────────────────
+# 需要：
+#   全集群 pods 的 list/watch（监听 Pod 事件）
+#   arc-history namespace 内 configmaps 的 CRUD（存/读历史）
+#   namespaces 的 get/list（确认 arc-history 存在）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-history-api-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+# ── 4. 绑定权限到 ServiceAccount ─────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-history-api-binding
+subjects:
+  - kind: ServiceAccount
+    name: pod-history-api
+    namespace: arc-history
+roleRef:
+  kind: ClusterRole
+  name: pod-history-api-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── 5. 主服务 Deployment ─────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-api
+  namespace: arc-history
+  labels:
+    app: pod-history-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-api
+  template:
+    metadata:
+      labels:
+        app: pod-history-api
+    spec:
+      serviceAccountName: pod-history-api
+      # 调度到 x86 节点（aarch64 镜像需单独构建）
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: api
+          # !! 替换为你的镜像地址，例如：
+          #    harbor.your-domain.com/infra/pod-history-api:v1
+          image: pod-history-api:v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: RETENTION_DAYS
+              value: "30"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+
+---
+# ── 6. 对外暴露服务（NodePort）────────────────────────────────
+# 访问地址：http://<任意节点IP>:30880/api/v1/envs/history
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-history-api
+  namespace: arc-history
+spec:
+  selector:
+    app: pod-history-api
+  type: NodePort
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30880
