@@ -541,6 +541,9 @@ def query_history(start_time: datetime, end_time: datetime,
     result = []
 
     for r in all_records:
+        ns = next(iter(r.get("groups", {})), None)
+        if ns in SKIP_NS:
+            continue
         if status and r.get("status") != status:
             continue
         if name_prefix and not r.get("name", "").startswith(name_prefix):
