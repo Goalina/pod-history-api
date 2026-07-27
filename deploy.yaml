@@ -74,15 +74,17 @@ spec:
         app: pod-history-api
     spec:
       serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
       # 调度到 x86 节点（aarch64 镜像需单独构建）
       nodeSelector:
         kubernetes.io/arch: amd64
       containers:
         - name: api
-          # !! 替换为你的镜像地址，例如：
-          #    harbor.your-domain.com/infra/pod-history-api:v1
-          image: pod-history-api:v1
-          imagePullPolicy: IfNotPresent
+          # 镜像由 GitHub Actions 自动构建推送到 ghcr.io
+          # 如需指定版本将 latest 改为对应 tag，如 v1.0.0
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
