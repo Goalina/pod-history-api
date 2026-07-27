@@ -35,7 +35,7 @@ MODE            = os.environ.get("MODE", "standalone")      # collector | api | 
 
 SKIP_NS = {
     "kube-system", "kube-public", "kube-node-lease",
-    "arc-history",
+    "arc-history", "arc-systems",
 }
 
 PHASE_TO_STATUS = {
