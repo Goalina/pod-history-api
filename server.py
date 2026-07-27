@@ -383,7 +383,17 @@ def _extract_record(pod) -> dict | None:
         wait_sec = int((start_time - creation_ts).total_seconds())
         wait_duration = format_duration(wait_sec) if wait_sec > 0 else "0s"
 
-    duration = format_duration(ttl_seconds) if (is_terminal and ttl_seconds) else ""
+    if is_terminal:
+        if ttl_seconds:
+            duration = format_duration(ttl_seconds)
+        elif start_time and end_time:
+            duration = format_duration(max(0, int((end_time - start_time).total_seconds())))
+        elif creation_ts and end_time:
+            duration = format_duration(max(0, int((end_time - creation_ts).total_seconds())))
+        else:
+            duration = ""
+    else:
+        duration = ""
 
     _NPU_RE = re.compile(r'ascend|npu|gpu', re.IGNORECASE)
 
@@ -536,7 +546,7 @@ def _cleanup_loop():
 # ──────────────────────────────────────────────────────────
 
 def query_history(start_time: datetime, end_time: datetime,
-                  status: str = None,
+                  status=None,
                   match_mode: str = "created",
                   name_prefix: str = None,
                   cluster_filter: str = None) -> list:
@@ -551,7 +561,7 @@ def query_history(start_time: datetime, end_time: datetime,
         ns = next(iter(r.get("groups", {})), None)
         if ns in SKIP_NS:
             continue
-        if status and r.get("status") != status:
+        if status and r.get("status") not in status:
             continue
         if name_prefix and not r.get("name", "").startswith(name_prefix):
             continue
@@ -637,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
             if start_time > end_time:
                 return self._err("start_time 不能晚于 end_time")
 
-            status_filter  = params.get("status",      [None])[0]
+            status_filter  = params.get("status",      [])   # 支持多值
             match_mode     = params.get("match_mode",  ["created"])[0]
             name_prefix    = params.get("name_prefix", [None])[0]
             cluster_filter = params.get("cluster",     [None])[0]
