@@ -385,27 +385,34 @@ def _extract_record(pod) -> dict | None:
 
     duration = format_duration(ttl_seconds) if (is_terminal and ttl_seconds) else ""
 
+    _NPU_RE = re.compile(r'ascend|npu|gpu', re.IGNORECASE)
+
+    def _parse_npu(reqs):
+        for key, val in (reqs or {}).items():
+            if _NPU_RE.search(key):
+                try:
+                    count = int(str(val))
+                except (ValueError, TypeError):
+                    count = 1 if val else 0
+                model = key.split("/")[-1]
+                res_type = "gpu" if "gpu" in key.lower() and "ascend" not in key.lower() else "npu"
+                return count, model, res_type
+        return 0, "", "container"
+
     devices = []
     for c in (spec.containers or []):
         res = c.resources
         cpu = mem = ""
-        npu = 0
-        if res and res.requests:
-            cpu = res.requests.get("cpu", "")
-            mem = res.requests.get("memory", "")
-            for npu_key in (
-                "huawei.com/Ascend910", "huawei.com/Ascend910B",
-                "huawei.com/Ascend310", "nvidia.com/gpu",
-            ):
-                val = res.requests.get(npu_key, "")
-                if val and str(val).isdigit():
-                    npu = int(val)
-                    break
+        reqs = (res.requests if res else None) or (res.limits if res else None)
+        if reqs:
+            cpu = reqs.get("cpu", "")
+            mem = reqs.get("memory", "")
+        npu, device_model, res_type = _parse_npu(reqs)
         pool = (spec.node_selector or {}).get("pool", "")
         devices.append({
             "cpu": cpu, "memory": mem, "npu": npu,
-            "pool": pool, "res_type": "container",
-            "device_model": "", "group": meta.namespace,
+            "pool": pool, "res_type": res_type,
+            "device_model": device_model, "group": meta.namespace,
         })
 
     resource_summary = {"total_devices": len(devices), "devices": devices} if devices else {}
