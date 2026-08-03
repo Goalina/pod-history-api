@@ -485,8 +485,6 @@ def _watch_loop():
                         _mark_terminal(uid)
 
                 elif phase in RUNNING_PHASES:
-                    if _is_running(uid):
-                        continue
                     if etype == "DELETED":
                         record = _extract_record(pod)
                         if record:
@@ -494,6 +492,22 @@ def _watch_loop():
                             record["expires_at"] = now_utc().isoformat()
                             _buffer_record(record)
                             _mark_terminal(uid)
+                    elif _is_running(uid):
+                        new_status = PHASE_TO_STATUS.get(phase)
+                        if new_status:
+                            with _db_lock:
+                                row = _db.execute(
+                                    "SELECT status FROM pod_history WHERE env_id = ? ORDER BY created_at DESC LIMIT 1",
+                                    (uid,),
+                                ).fetchone()
+                            if row and row[0] != new_status:
+                                with _db_lock:
+                                    _db.execute(
+                                        "UPDATE pod_history SET status = ? WHERE env_id = ?",
+                                        (new_status, uid),
+                                    )
+                                    _db.commit()
+                                log.info(f"[{new_status}] {ns}/{pod.metadata.name} 状态更新（原 {row[0]}）")
                     else:
                         record = _extract_record(pod)
                         if record:
