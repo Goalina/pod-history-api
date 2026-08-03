@@ -164,7 +164,7 @@ def _db_path_for_collector() -> str:
 
 def _open_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(_CREATE_TABLE_SQL)
     for idx_sql in _CREATE_INDEXES_SQL:
