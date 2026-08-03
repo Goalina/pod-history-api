@@ -2,31 +2,17 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   annotations:
-    kubectl.kubernetes.io/last-applied-configuration: |
-      {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"annotations":{},"name":"pod-history-data","namespace":"arc-history"},"spec":{"accessModes":["ReadWriteMany"],"resources":{"requests":{"storage":"100Gi"}},"storageClassName":"csi-sfsturbo"}}
-    pv.kubernetes.io/bind-completed: "yes"
-    pv.kubernetes.io/bound-by-controller: "yes"
-    volume.beta.kubernetes.io/storage-provisioner: everest-csi-provisioner
-    volume.kubernetes.io/storage-provisioner: everest-csi-provisioner
-  creationTimestamp: "2026-08-03T02:27:30Z"
-  finalizers:
-  - kubernetes.io/pvc-protection
+    everest.io/path: /pod-history
+    everest.io/reclaim-policy: retain-volume-only
+    everest.io/sfsturbo-share-id: 39a33a00-3be8-4345-8079-63cf23a44a88
+    everest.io/volume-as: absolute-path
+    pvc-can-cleanup: "true"
   name: pod-history-data
   namespace: arc-history
-  resourceVersion: "840715399"
-  uid: 35212652-3c02-435d-897b-1f7bcd4783c2
 spec:
   accessModes:
-  - ReadWriteMany
+    - ReadWriteMany
   resources:
     requests:
       storage: 100Gi
   storageClassName: csi-sfsturbo
-  volumeMode: Filesystem
-  volumeName: pvc-35212652-3c02-435d-897b-1f7bcd4783c2
-status:
-  accessModes:
-  - ReadWriteMany
-  capacity:
-    storage: 100Gi
-  phase: Bound
