@@ -1,29 +1,23 @@
 # ============================================================
-# Pod 历史记录服务 — K8s 部署清单
-# 集群: openmerlin-guiyang-006
+# Pod 历史记录服务 — K8s 部署清单（SQLite 存储）
 # kubectl apply -f deploy.yaml
 # ============================================================
 
-# ── 1. 存储历史数据的专用 namespace ──────────────────────────
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: arc-history
-
 ---
-# ── 2. 服务运行身份 ──────────────────────────────────────────
 apiVersion: v1
-kind: ServiceAccount
+kind: PersistentVolumeClaim
 metadata:
-  name: pod-history-api
+  name: pod-history-data
   namespace: arc-history
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: csi-sfsturbo
+  resources:
+    requests:
+      storage: 100Gi
 
 ---
-# ── 3. 权限声明 ──────────────────────────────────────────────
-# 需要：
-#   全集群 pods 的 list/watch（监听 Pod 事件）
-#   arc-history namespace 内 configmaps 的 CRUD（存/读历史）
-#   namespaces 的 get/list（确认 arc-history 存在）
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -34,65 +28,54 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "create"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list"]
 
 ---
-# ── 4. 绑定权限到 ServiceAccount ─────────────────────────────
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: pod-history-api-binding
-subjects:
-  - kind: ServiceAccount
-    name: pod-history-api
-    namespace: arc-history
-roleRef:
-  kind: ClusterRole
-  name: pod-history-api-role
-  apiGroup: rbac.authorization.k8s.io
-
----
-# ── 5. 主服务 Deployment ─────────────────────────────────────
+# ── API Server ─────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pod-history-api
+  name: pod-history-api-server
   namespace: arc-history
-  labels:
-    app: pod-history-api
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pod-history-api
+      app: pod-history-api-server
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
   template:
     metadata:
       labels:
-        app: pod-history-api
+        app: pod-history-api-server
     spec:
       serviceAccountName: pod-history-api
       imagePullSecrets:
         - name: huawei-swr-image-pull-secret-model-gy
-      # 调度到 x86 节点（aarch64 镜像需单独构建）
       nodeSelector:
         kubernetes.io/arch: amd64
       containers:
         - name: api
-          # 镜像由 GitHub Actions 自动构建推送到 ghcr.io
-          # 如需指定版本将 latest 改为对应 tag，如 v1.0.0
           image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
           imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
           env:
+            - name: MODE
+              value: "api"
             - name: PORT
               value: "8080"
             - name: RETENTION_DAYS
               value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
           resources:
             requests:
               cpu: "100m"
@@ -112,21 +95,518 @@ spec:
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
 
 ---
-# ── 6. 对外暴露服务（NodePort）────────────────────────────────
-# 访问地址：http://<任意节点IP>:30880/api/v1/envs/history
-apiVersion: v1
-kind: Service
+# ── Collector: gy006 (本集群) ──────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: pod-history-api
+  name: pod-history-collector-gy-006
   namespace: arc-history
 spec:
+  replicas: 1
   selector:
-    app: pod-history-api
-  type: NodePort
-  ports:
-    - name: http
-      port: 8080
-      targetPort: 8080
-      nodePort: 30880
+    matchLabels:
+      app: pod-history-collector-gy-006
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: pod-history-collector-gy-006
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "gy006"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+
+---
+# ── Collector: gy003 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-gy-003
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-gy-003
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-gy003.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-gy003.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-gy003.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.gy003 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-gy-003
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "gy003"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/gy003.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: gy-004 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-gy-004
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-gy-004
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-gy004.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-gy004.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-gy004.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.gy004 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-gy-004
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "gy-004"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/gy004.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: gy-005 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-gy-005
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-gy-005
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-gy005.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-gy005.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-gy005.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.gy005 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-gy-005
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "gy-005"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/gy005.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: aiframework-hb3 (远程集群，Vault 注入 kubeconfig) ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-aiframework-hb3
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-aiframework-hb3
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-aiframework-hb3.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-aiframework-hb3.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-aiframework-hb3.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.aiframeworkHb3 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-aiframework-hb3
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "aiframework-hb3"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/aiframework-hb3.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: hk-001 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-hk-001
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-hk-001
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-hk001.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-hk001.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-hk001.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.hk001 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-hk-001
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "hk-001"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/hk001.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: verl-hb3 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-verl-hb3
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-verl-hb3
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-verl-hb3.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-verl-hb3.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-verl-hb3.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.VerlHb3 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-verl-hb3
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "verl-hb3"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/verl-hb3.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DB_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-data
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token

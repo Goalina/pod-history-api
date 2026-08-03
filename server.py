@@ -3,15 +3,19 @@
 Pod 历史记录服务 — GET /api/v1/envs/history
 符合 resource-deploy-core 3.8.1 规范，支持多集群架构：
 
-  MODE=collector  连目标集群 watch pod，写入管理集群 arc-history ConfigMap
-  MODE=api        聚合 arc-history 全部集群数据，提供 HTTP 接口
+  MODE=collector  连目标集群 watch pod，写入 SQLite（/data/{CLUSTER_ID}.db）
+  MODE=api        聚合 /data/*.db 全部集群数据，提供 HTTP 接口
   MODE=standalone 单集群模式（默认，兼容旧部署）
+
+存储：SQLite（/data/{CLUSTER_ID}.db），替代 ConfigMap
+每个 collector 写自己的 db 文件，API 读取所有 db 聚合，无写冲突。
 """
 
 import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -19,19 +23,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from kubernetes import client as k8s_client, config as k8s_config, watch as k8s_watch
-from kubernetes.client.rest import ApiException
 
 # ──────────────────────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────────────────────
-HISTORY_NS      = "arc-history"
 RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "30"))
 PORT            = int(os.environ.get("PORT", "8080"))
+DB_DIR          = os.environ.get("DB_DIR", "/data")
+FLUSH_INTERVAL  = int(os.environ.get("FLUSH_INTERVAL", "5"))
 
-# 多集群模式环境变量
-CLUSTER_ID      = os.environ.get("CLUSTER_ID", "")         # collector 标识，用于 ConfigMap 前缀
-KUBECONFIG_PATH = os.environ.get("KUBECONFIG_PATH", "")    # 目标集群 kubeconfig 路径（collector 用）
-MODE            = os.environ.get("MODE", "standalone")      # collector | api | standalone
+CLUSTER_ID      = os.environ.get("CLUSTER_ID", "")
+KUBECONFIG_PATH = os.environ.get("KUBECONFIG_PATH", "")
+MODE            = os.environ.get("MODE", "standalone")
 
 SKIP_NS = {
     "kube-system", "kube-public", "kube-node-lease",
@@ -56,41 +59,33 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────
-# K8s 客户端（双客户端架构）
-# _storage_core: 管理集群 in-cluster，用于读写 arc-history ConfigMap
-# _watch_core:   目标集群（collector 模式通过 KUBECONFIG_PATH），用于 watch Pod
+# K8s 客户端
 # ──────────────────────────────────────────────────────────
-_storage_core: k8s_client.CoreV1Api = None
-_watch_core:   k8s_client.CoreV1Api = None
+_k8s_core: k8s_client.CoreV1Api = None
 
 
 def _init_k8s():
-    global _storage_core, _watch_core
-
-    # 存储客户端：in-cluster 优先（管理集群），否则 KUBECONFIG 文件
-    try:
-        k8s_config.load_incluster_config()
-        log.info("存储客户端: in-cluster ServiceAccount")
-    except k8s_config.ConfigException:
-        k8s_config.load_kube_config()
-        log.info("存储客户端: kubeconfig 文件")
-    _storage_core = k8s_client.CoreV1Api()
-
-    # 监听客户端：KUBECONFIG_PATH 指定时独立加载，否则与存储共用
+    global _k8s_core
     if KUBECONFIG_PATH:
-        watch_cfg = k8s_client.Configuration()
+        cfg = k8s_client.Configuration()
         k8s_config.load_kube_config(
             config_file=KUBECONFIG_PATH,
-            client_configuration=watch_cfg,
+            client_configuration=cfg,
         )
-        _watch_core = k8s_client.CoreV1Api(k8s_client.ApiClient(watch_cfg))
-        log.info(f"监听客户端: {KUBECONFIG_PATH}")
+        _k8s_core = k8s_client.CoreV1Api(k8s_client.ApiClient(cfg))
+        log.info(f"K8s 客户端: {KUBECONFIG_PATH}")
     else:
-        _watch_core = _storage_core
-        log.info("监听客户端: 与存储客户端共用")
+        try:
+            k8s_config.load_incluster_config()
+            log.info("K8s 客户端: in-cluster ServiceAccount")
+        except k8s_config.ConfigException:
+            k8s_config.load_kube_config()
+            log.info("K8s 客户端: kubeconfig 文件")
+        _k8s_core = k8s_client.CoreV1Api()
 
 
-_init_k8s()
+if MODE in ("collector", "standalone"):
+    _init_k8s()
 
 
 # ──────────────────────────────────────────────────────────
@@ -128,214 +123,186 @@ def now_utc() -> datetime:
 
 
 # ──────────────────────────────────────────────────────────
-# ConfigMap 命名（带集群前缀）
-# 格式：history-{cluster_id}-YYYY-MM-DD 或 history-YYYY-MM-DD（无前缀兼容旧数据）
+# SQLite 存储
 # ──────────────────────────────────────────────────────────
-_CM_LEGACY_RE  = re.compile(r'^history-(\d{4}-\d{2}-\d{2})$')
-_CM_CLUSTER_RE = re.compile(r'^history-(.+)-(\d{4}-\d{2}-\d{2})$')
+
+_CREATE_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS pod_history (
+        env_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        cluster TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        created_at TEXT,
+        expires_at TEXT,
+        ttl_seconds INTEGER DEFAULT 0,
+        duration TEXT DEFAULT '',
+        wait_duration TEXT DEFAULT '',
+        groups TEXT DEFAULT '{}',
+        extend_env_comments TEXT DEFAULT '{}',
+        resource_summary TEXT DEFAULT '{}',
+        _namespace TEXT DEFAULT '',
+        _node TEXT DEFAULT '',
+        _image TEXT DEFAULT '',
+        _exit_code INTEGER,
+        _updated_at TEXT NOT NULL
+    )
+"""
+
+_CREATE_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_status ON pod_history(status)",
+    "CREATE INDEX IF NOT EXISTS idx_created_at ON pod_history(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cluster ON pod_history(cluster)",
+    "CREATE INDEX IF NOT EXISTS idx_name ON pod_history(name)",
+]
 
 
-def _cm_name(date_str: str) -> str:
-    if CLUSTER_ID:
-        return f"history-{CLUSTER_ID}-{date_str}"
-    return f"history-{date_str}"
+def _db_path_for_collector() -> str:
+    if MODE == "collector" and CLUSTER_ID:
+        return os.path.join(DB_DIR, f"{CLUSTER_ID}.db")
+    return os.path.join(DB_DIR, "pod-history.db")
 
 
-def _parse_cm_name(name: str):
-    """返回 (cluster_id, date_str)，解析失败返回 (None, None)"""
-    m = _CM_LEGACY_RE.match(name)
-    if m:
-        return "", m.group(1)
-    m = _CM_CLUSTER_RE.match(name)
-    if m:
-        return m.group(1), m.group(2)
-    return None, None
+def _open_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(_CREATE_TABLE_SQL)
+    for idx_sql in _CREATE_INDEXES_SQL:
+        conn.execute(idx_sql)
+    conn.commit()
+    return conn
+
+
+def _discover_dbs() -> list[str]:
+    try:
+        return sorted(
+            os.path.join(DB_DIR, f)
+            for f in os.listdir(DB_DIR)
+            if f.endswith(".db")
+        )
+    except FileNotFoundError:
+        return []
+
+
+_db: sqlite3.Connection = None
+_db_lock = threading.Lock()
+
+
+def _init_db():
+    global _db
+    os.makedirs(DB_DIR, exist_ok=True)
+    path = _db_path_for_collector()
+    _db = _open_db(path)
+    log.info(f"SQLite 数据库已初始化: {path}")
+
+
+if MODE in ("collector", "standalone"):
+    _init_db()
 
 
 # ──────────────────────────────────────────────────────────
-# UID 去重（只对终态 Pod 标记"已写入"）
+# UID 去重（运行中 / 终态 分离）
 # ──────────────────────────────────────────────────────────
-_recorded_uids: set = set()
+_running_uids: set = set()
+_terminal_uids: set = set()
 _uid_lock = threading.Lock()
 
 
-def _load_today_uids():
-    date_str = now_utc().strftime("%Y-%m-%d")
-    try:
-        cm = _storage_core.read_namespaced_config_map(_cm_name(date_str), HISTORY_NS)
-        records = json.loads(cm.data.get("records", "[]"))
-        terminal = {"released", "rejected", "expired"}
-        uids = {r.get("env_id") for r in records
-                if r.get("env_id") and r.get("status") in terminal}
-        with _uid_lock:
-            _recorded_uids.update(uids)
-        log.info(f"从今日历史加载 {len(uids)} 条已终态 UID")
-    except ApiException as e:
-        if e.status != 404:
-            log.warning(f"加载已记录 UID 失败: {e}")
-
-
-def _is_recorded(uid: str) -> bool:
+def _load_uids_from_db():
+    with _db_lock:
+        rows = _db.execute("SELECT env_id, status FROM pod_history").fetchall()
     with _uid_lock:
-        return uid in _recorded_uids
+        for uid, status in rows:
+            if uid:
+                if status in ("released", "rejected", "expired"):
+                    _terminal_uids.add(uid)
+                else:
+                    _running_uids.add(uid)
+    log.info(f"从数据库加载 {len(_terminal_uids)} 条终态 UID, {len(_running_uids)} 条运行中 UID")
 
 
-def _mark_recorded(uid: str):
+def _is_running(uid: str) -> bool:
     with _uid_lock:
-        _recorded_uids.add(uid)
+        return uid in _running_uids
+
+
+def _is_terminal(uid: str) -> bool:
+    with _uid_lock:
+        return uid in _terminal_uids
+
+
+def _mark_running(uid: str):
+    with _uid_lock:
+        _running_uids.add(uid)
+
+
+def _mark_terminal(uid: str):
+    with _uid_lock:
+        _running_uids.discard(uid)
+        _terminal_uids.add(uid)
 
 
 # ──────────────────────────────────────────────────────────
-# ConfigMap 存储（写入管理集群 arc-history，按天+集群分片）
+# 写入缓冲 + 定时刷盘
 # ──────────────────────────────────────────────────────────
-_cm_lock = threading.Lock()
+_pending_records: dict[str, dict] = {}
+_pending_lock = threading.Lock()
 
 
-def _ensure_history_ns():
-    try:
-        _storage_core.read_namespace(HISTORY_NS)
-    except ApiException as e:
-        if e.status == 404:
-            _storage_core.create_namespace(k8s_client.V1Namespace(
-                metadata=k8s_client.V1ObjectMeta(name=HISTORY_NS)
-            ))
-            log.info(f"已创建 namespace: {HISTORY_NS}")
+def _buffer_record(record: dict):
+    uid = record.get("env_id", "")
+    if not uid:
+        return
+    with _pending_lock:
+        _pending_records[uid] = record
 
 
-def _upsert_record(record: dict):
-    date_str = now_utc().strftime("%Y-%m-%d")
-    cm_name  = _cm_name(date_str)
-    uid      = record.get("env_id", "")
+def _flush_buffer():
+    with _pending_lock:
+        if not _pending_records:
+            return
+        records = list(_pending_records.values())
+        _pending_records.clear()
 
-    with _cm_lock:
+    with _db_lock:
+        with _db:
+            _db.executemany(
+                """INSERT OR REPLACE INTO pod_history
+                   (env_id, name, cluster, status, created_at, expires_at,
+                    ttl_seconds, duration, wait_duration, groups,
+                    extend_env_comments, resource_summary,
+                    _namespace, _node, _image, _exit_code, _updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(
+                    r.get("env_id", ""),
+                    r.get("name", ""),
+                    r.get("cluster", ""),
+                    r.get("status", ""),
+                    r.get("created_at", ""),
+                    r.get("expires_at", ""),
+                    r.get("ttl_seconds", 0),
+                    r.get("duration", ""),
+                    r.get("wait_duration", ""),
+                    json.dumps(r.get("groups", {}), ensure_ascii=False),
+                    json.dumps(r.get("extend_env_comments", {}), ensure_ascii=False),
+                    json.dumps(r.get("resource_summary", {}), ensure_ascii=False),
+                    r.get("_namespace", ""),
+                    r.get("_node", ""),
+                    r.get("_image", ""),
+                    r.get("_exit_code"),
+                    now_utc().isoformat(),
+                ) for r in records],
+            )
+    log.info(f"刷盘 {len(records)} 条记录")
+
+
+def _flush_loop():
+    while True:
+        time.sleep(FLUSH_INTERVAL)
         try:
-            cm = _storage_core.read_namespaced_config_map(cm_name, HISTORY_NS)
-            records = json.loads(cm.data.get("records", "[]"))
-            found = False
-            for i, r in enumerate(records):
-                if r.get("env_id") == uid:
-                    records[i] = record
-                    found = True
-                    break
-            if not found:
-                records.append(record)
-            cm.data["records"] = json.dumps(records, ensure_ascii=False)
-            _storage_core.replace_namespaced_config_map(cm_name, HISTORY_NS, cm)
-        except ApiException as e:
-            if e.status == 404:
-                labels = {"arc.local/type": "pod-history", "date": date_str}
-                if CLUSTER_ID:
-                    labels["cluster"] = CLUSTER_ID
-                new_cm = k8s_client.V1ConfigMap(
-                    metadata=k8s_client.V1ObjectMeta(
-                        name=cm_name,
-                        namespace=HISTORY_NS,
-                        labels=labels,
-                    ),
-                    data={"records": json.dumps([record], ensure_ascii=False)},
-                )
-                _storage_core.create_namespaced_config_map(HISTORY_NS, new_cm)
-                log.info(f"创建历史 ConfigMap: {cm_name}")
-            else:
-                log.error(f"写入历史失败: {e}")
-
-
-def _list_records_for_cluster(cluster_id: str, days: int) -> list:
-    """读取指定集群最近 N 天的记录，同 UID 保留最新版本。"""
-    result    = []
-    seen_uids = set()
-    today     = now_utc()
-
-    for i in range(days):
-        date_str = datetime.fromtimestamp(
-            today.timestamp() - i * 86400, tz=timezone.utc
-        ).strftime("%Y-%m-%d")
-
-        if cluster_id:
-            cm_name = f"history-{cluster_id}-{date_str}"
-        else:
-            cm_name = f"history-{date_str}"
-
-        try:
-            cm = _storage_core.read_namespaced_config_map(cm_name, HISTORY_NS)
-            records = json.loads(cm.data.get("records", "[]"))
-            for r in records:
-                uid = r.get("env_id", "")
-                if uid and uid in seen_uids:
-                    continue
-                if uid:
-                    seen_uids.add(uid)
-                # 补全 cluster 字段
-                if "cluster" not in r:
-                    r = dict(r)
-                    r["cluster"] = cluster_id or "gy006"
-                result.append(r)
-        except ApiException as e:
-            if e.status != 404:
-                log.warning(f"读取 {cm_name} 失败: {e}")
-
-    return result
-
-
-def _list_all_records_api(days: int, cluster_filter: str = None) -> list:
-    """
-    API 模式：列举 arc-history 下所有 history-* ConfigMap，
-    跨集群聚合，可按 cluster 过滤。
-    """
-    try:
-        cms = _storage_core.list_namespaced_config_map(
-            HISTORY_NS, label_selector="arc.local/type=pod-history"
-        )
-    except ApiException as e:
-        log.warning(f"列举 ConfigMap 失败: {e}")
-        return []
-
-    # 发现所有集群
-    clusters_found = set()
-    for cm in cms.items:
-        c, _ = _parse_cm_name(cm.metadata.name)
-        if c is not None:
-            clusters_found.add(c)
-
-    if cluster_filter is not None:
-        clusters_to_read = {cluster_filter} if cluster_filter in clusters_found else set()
-    else:
-        clusters_to_read = clusters_found
-
-    result = []
-    for c in clusters_to_read:
-        result.extend(_list_records_for_cluster(c, days))
-    return result
-
-
-def _list_all_records(days: int = RETENTION_DAYS, cluster_filter: str = None) -> list:
-    if MODE == "api":
-        return _list_all_records_api(days, cluster_filter)
-    return _list_records_for_cluster(CLUSTER_ID, days)
-
-
-def _cleanup_old_history():
-    cutoff = datetime.fromtimestamp(
-        now_utc().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        - RETENTION_DAYS * 86400,
-        tz=timezone.utc,
-    )
-    try:
-        cms = _storage_core.list_namespaced_config_map(
-            HISTORY_NS, label_selector="arc.local/type=pod-history"
-        )
-        for cm in cms.items:
-            _, date_str = _parse_cm_name(cm.metadata.name)
-            if not date_str:
-                continue
-            try:
-                if datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc) < cutoff:
-                    _storage_core.delete_namespaced_config_map(cm.metadata.name, HISTORY_NS)
-                    log.info(f"清理过期历史: {cm.metadata.name}")
-            except Exception:
-                pass
-    except Exception as e:
-        log.error(f"清理历史时出错: {e}")
+            _flush_buffer()
+        except Exception as e:
+            log.error(f"刷盘失败: {e}")
 
 
 # ──────────────────────────────────────────────────────────
@@ -458,7 +425,7 @@ def _watch_loop():
         try:
             w = k8s_watch.Watch()
             for event in w.stream(
-                _watch_core.list_pod_for_all_namespaces,
+                _k8s_core.list_pod_for_all_namespaces,
                 timeout_seconds=300,
             ):
                 etype = event["type"]
@@ -471,9 +438,7 @@ def _watch_loop():
                     continue
 
                 if phase in TERMINAL_PHASES:
-                    if etype not in ("MODIFIED", "DELETED"):
-                        continue
-                    if _is_recorded(uid):
+                    if _is_terminal(uid):
                         continue
                     record = _extract_record(pod)
                     if record:
@@ -481,23 +446,24 @@ def _watch_loop():
                             f"[{record['status']}] {ns}/{record['name']} "
                             f"时长={record['duration']} 节点={record['_node']}"
                         )
-                        _upsert_record(record)
-                        _mark_recorded(uid)
+                        _buffer_record(record)
+                        _mark_terminal(uid)
 
                 elif phase in RUNNING_PHASES:
-                    if _is_recorded(uid):
+                    if _is_running(uid):
                         continue
                     if etype == "DELETED":
                         record = _extract_record(pod)
                         if record:
                             record["status"]     = "expired"
                             record["expires_at"] = now_utc().isoformat()
-                            _upsert_record(record)
-                            _mark_recorded(uid)
+                            _buffer_record(record)
+                            _mark_terminal(uid)
                     else:
                         record = _extract_record(pod)
                         if record:
-                            _upsert_record(record)
+                            _buffer_record(record)
+                            _mark_running(uid)
 
         except Exception as e:
             log.error(f"Pod watcher 异常，5s 后重启: {e}")
@@ -511,7 +477,7 @@ def _watch_loop():
 def _initial_scan():
     log.info(f"初始扫描集群 [{CLUSTER_ID or 'local'}] 运行中 Pod …")
     try:
-        pods = _watch_core.list_pod_for_all_namespaces()
+        pods = _k8s_core.list_pod_for_all_namespaces()
         count = 0
         for pod in pods.items:
             if pod.metadata.namespace in SKIP_NS:
@@ -519,84 +485,166 @@ def _initial_scan():
             phase = (pod.status.phase or "Unknown") if pod.status else "Unknown"
             if phase not in RUNNING_PHASES:
                 continue
-            if _is_recorded(pod.metadata.uid):
+            if _is_running(pod.metadata.uid) or _is_terminal(pod.metadata.uid):
                 continue
             record = _extract_record(pod)
             if record:
-                _upsert_record(record)
+                _buffer_record(record)
+                _mark_running(pod.metadata.uid)
                 count += 1
-        log.info(f"初始扫描完成，写入 {count} 条运行中记录")
+        log.info(f"初始扫描完成，缓冲 {count} 条运行中记录")
     except Exception as e:
         log.error(f"初始扫描失败: {e}")
 
 
 # ──────────────────────────────────────────────────────────
-# 后台线程 2：每天清理过期历史（api / standalone 模式运行）
+# 后台线程 2：每天清理过期历史
 # ──────────────────────────────────────────────────────────
+
+def _cleanup_db(conn: sqlite3.Connection, path: str):
+    cutoff = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = datetime.fromtimestamp(
+        cutoff.timestamp() - RETENTION_DAYS * 86400,
+        tz=timezone.utc,
+    )
+    try:
+        cur = conn.execute(
+            "DELETE FROM pod_history WHERE created_at < ?",
+            (cutoff.isoformat(),),
+        )
+        conn.commit()
+        if cur.rowcount:
+            log.info(f"清理 {os.path.basename(path)}: 删除 {cur.rowcount} 条 {cutoff.isoformat()} 之前记录")
+    except Exception as e:
+        log.error(f"清理 {path} 失败: {e}")
+
+
+def _cleanup_old_history():
+    if MODE == "api":
+        for db_path in _discover_dbs():
+            try:
+                conn = _open_db(db_path)
+                try:
+                    _cleanup_db(conn, db_path)
+                finally:
+                    conn.close()
+            except Exception as e:
+                log.error(f"清理 {db_path} 失败: {e}")
+    else:
+        with _db_lock:
+            _cleanup_db(_db, _db_path_for_collector())
+
 
 def _cleanup_loop():
     while True:
         time.sleep(86400)
         log.info("开始清理过期历史 …")
-        _cleanup_old_history()
+        try:
+            _cleanup_old_history()
+        except Exception as e:
+            log.error(f"清理历史时出错: {e}")
 
 
 # ──────────────────────────────────────────────────────────
-# 3.8.1 查询逻辑
+# 3.8.1 查询逻辑（SQL）
 # ──────────────────────────────────────────────────────────
+
+def _build_query(start_time: datetime, end_time: datetime,
+                 status=None, match_mode: str = "created",
+                 name_prefix: str = None, cluster_filter: str = None) -> tuple[str, list]:
+    conditions = []
+    params = []
+
+    ns_placeholders = ",".join("?" for _ in SKIP_NS)
+    conditions.append(f"_namespace NOT IN ({ns_placeholders})")
+    params.extend(SKIP_NS)
+
+    if match_mode == "created":
+        conditions.append("created_at >= ?")
+        params.append(start_time.isoformat())
+        conditions.append("created_at <= ?")
+        params.append(end_time.isoformat())
+    elif match_mode == "released":
+        conditions.append("expires_at >= ?")
+        params.append(start_time.isoformat())
+        conditions.append("expires_at <= ?")
+        params.append(end_time.isoformat())
+        conditions.append("expires_at IS NOT NULL")
+        conditions.append("expires_at != ''")
+    elif match_mode == "overlap":
+        conditions.append("created_at <= ?")
+        params.append(end_time.isoformat())
+        conditions.append("(expires_at IS NULL OR expires_at = '' OR expires_at >= ?)")
+        params.append(start_time.isoformat())
+
+    if status:
+        placeholders = ",".join("?" for _ in status)
+        conditions.append(f"status IN ({placeholders})")
+        params.extend(status)
+
+    if name_prefix:
+        conditions.append("name LIKE ?")
+        params.append(f"{name_prefix}%")
+
+    if cluster_filter:
+        conditions.append("cluster = ?")
+        params.append(cluster_filter)
+
+    where = " AND ".join(conditions)
+    sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
+    return sql, params
+
+
+def _rows_to_records(rows, col_names) -> list:
+    now = now_utc()
+    result = []
+    for row in rows:
+        r = dict(zip(col_names, row))
+        for json_field in ("groups", "extend_env_comments", "resource_summary"):
+            if r.get(json_field):
+                try:
+                    r[json_field] = json.loads(r[json_field])
+                except (json.JSONDecodeError, TypeError):
+                    r[json_field] = {}
+        if r.get("status") in ("active", "provisioning") and r.get("created_at"):
+            r_created = parse_iso(r["created_at"])
+            if r_created:
+                elapsed = max(0, int((now - r_created).total_seconds()))
+                r["duration"] = format_duration(elapsed)
+        result.append(r)
+    return result
+
 
 def query_history(start_time: datetime, end_time: datetime,
                   status=None,
                   match_mode: str = "created",
                   name_prefix: str = None,
                   cluster_filter: str = None) -> list:
-    delta_days = int((now_utc() - start_time).days) + 2
-    delta_days = min(delta_days, RETENTION_DAYS)
-    all_records = _list_all_records(days=delta_days, cluster_filter=cluster_filter)
+    if MODE in ("collector", "standalone"):
+        _flush_buffer()
 
-    now    = now_utc()
-    result = []
+    sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter)
 
-    for r in all_records:
-        ns = next(iter(r.get("groups", {})), None)
-        if ns in SKIP_NS:
-            continue
-        if status and r.get("status") not in status:
-            continue
-        if name_prefix and not r.get("name", "").startswith(name_prefix):
-            continue
+    if MODE == "api":
+        all_results = []
+        for db_path in _discover_dbs():
+            try:
+                conn = _open_db(db_path)
+                try:
+                    rows = conn.execute(sql, params).fetchall()
+                    col_names = [d[0] for d in conn.execute("SELECT * FROM pod_history LIMIT 0").description]
+                    all_results.extend(_rows_to_records(rows, col_names))
+                finally:
+                    conn.close()
+            except Exception as e:
+                log.error(f"查询 {db_path} 失败: {e}")
+        all_results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return all_results
 
-        r_status  = r.get("status", "")
-        r_created = parse_iso(r.get("created_at", ""))
-        r_expires = parse_iso(r.get("expires_at", "")) if r.get("expires_at") else None
-
-        if r_status in ("active", "provisioning"):
-            r = dict(r)
-            if r_created:
-                elapsed = max(0, int((now - r_created).total_seconds()))
-                r["duration"] = format_duration(elapsed)
-            r_end = now
-        else:
-            r_end = r_expires or now
-
-        if match_mode == "created":
-            if not r_created or not (start_time <= r_created <= end_time):
-                continue
-        elif match_mode == "released":
-            if not r_expires:
-                continue
-            if not (start_time <= r_expires <= end_time):
-                continue
-        elif match_mode == "overlap":
-            if not r_created:
-                continue
-            if r_created > end_time or r_end < start_time:
-                continue
-
-        result.append(r)
-
-    result.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return result
+    with _db_lock:
+        rows = _db.execute(sql, params).fetchall()
+        col_names = [d[0] for d in _db.execute("SELECT * FROM pod_history LIMIT 0").description]
+    return _rows_to_records(rows, col_names)
 
 
 # ──────────────────────────────────────────────────────────
@@ -647,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
             if start_time > end_time:
                 return self._err("start_time 不能晚于 end_time")
 
-            status_filter  = params.get("status",      [])   # 支持多值
+            status_filter  = params.get("status",      [])
             match_mode     = params.get("match_mode",  ["created"])[0]
             name_prefix    = params.get("name_prefix", [None])[0]
             cluster_filter = params.get("cluster",     [None])[0]
@@ -678,12 +726,12 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     log.info(f"启动模式: {MODE}, 集群: [{CLUSTER_ID or 'local'}]")
-    _ensure_history_ns()
 
     if MODE in ("collector", "standalone"):
-        _load_today_uids()
+        _load_uids_from_db()
         _initial_scan()
         threading.Thread(target=_watch_loop, daemon=True, name="watcher").start()
+        threading.Thread(target=_flush_loop, daemon=True, name="flush").start()
 
     if MODE in ("api", "standalone"):
         threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
@@ -691,6 +739,6 @@ if __name__ == "__main__":
         server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
         server.serve_forever()
     else:
-        # collector 模式：无 HTTP 服务，主线程阻塞等待
+        threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
         log.info("collector 模式运行中，等待 Pod 事件 …")
         threading.Event().wait()
