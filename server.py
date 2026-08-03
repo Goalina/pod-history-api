@@ -62,26 +62,30 @@ log = logging.getLogger(__name__)
 # K8s 客户端
 # ──────────────────────────────────────────────────────────
 _k8s_core: k8s_client.CoreV1Api = None
+_k8s_custom: k8s_client.CustomObjectsApi = None
 
 
 def _init_k8s():
-    global _k8s_core
+    global _k8s_core, _k8s_custom
     if KUBECONFIG_PATH:
         cfg = k8s_client.Configuration()
         k8s_config.load_kube_config(
             config_file=KUBECONFIG_PATH,
             client_configuration=cfg,
         )
-        _k8s_core = k8s_client.CoreV1Api(k8s_client.ApiClient(cfg))
+        api_client = k8s_client.ApiClient(cfg)
+        _k8s_core = k8s_client.CoreV1Api(api_client)
+        _k8s_custom = k8s_client.CustomObjectsApi(api_client)
         log.info(f"K8s 客户端: {KUBECONFIG_PATH}")
     else:
         try:
             k8s_config.load_incluster_config()
             log.info("K8s 客户端: in-cluster ServiceAccount")
-        except k8s_config.ConfigException:
+        except k8s_client.ConfigException:
             k8s_config.load_kube_config()
             log.info("K8s 客户端: kubeconfig 文件")
         _k8s_core = k8s_client.CoreV1Api()
+        _k8s_custom = k8s_client.CustomObjectsApi()
 
 
 if MODE in ("collector", "standalone"):
@@ -395,6 +399,35 @@ def _extract_record(pod) -> dict | None:
     resource_summary = {"total_devices": len(devices), "devices": devices} if devices else {}
     groups = {meta.namespace: {"device_count": len(devices)}}
 
+    extend_env_comments = {}
+    if meta.name.endswith("-workflow") and _k8s_custom:
+        runner_name = meta.name[: -len("-workflow")]
+        try:
+            runner = _k8s_custom.get_namespaced_custom_object(
+                group="actions.github.com",
+                version="v1alpha1",
+                namespace=meta.namespace,
+                plural="ephemeralrunners",
+                name=runner_name,
+            )
+            rs = runner.get("status", {})
+            rl = runner.get("metadata", {}).get("labels", {})
+            extend_env_comments = {
+                "workflow_ref": rs.get("jobWorkflowRef", ""),
+                "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
+                "job_display_name": rs.get("jobDisplayName", ""),
+                "job_id": rs.get("jobId", ""),
+                "job_repository": rs.get("jobRepositoryName", ""),
+                "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
+                "organization": rl.get("actions.github.com/organization", ""),
+                "repository": rl.get("actions.github.com/repository", ""),
+            }
+            extend_env_comments = {k: v for k, v in extend_env_comments.items() if v}
+            if extend_env_comments:
+                log.info(f"  EphemeralRunner {runner_name}: job={extend_env_comments.get('job_display_name', '')}")
+        except Exception as e:
+            log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
+
     return {
         "env_id":              meta.uid,
         "name":                meta.name,
@@ -406,7 +439,7 @@ def _extract_record(pod) -> dict | None:
         "duration":            duration,
         "wait_duration":       wait_duration,
         "groups":              groups,
-        "extend_env_comments": {},
+        "extend_env_comments": extend_env_comments,
         "resource_summary":    resource_summary,
         "_namespace":          meta.namespace,
         "_node":               (spec.node_name or ""),
