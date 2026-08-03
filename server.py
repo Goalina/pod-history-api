@@ -36,6 +36,8 @@ CLUSTER_ID      = os.environ.get("CLUSTER_ID", "")
 KUBECONFIG_PATH = os.environ.get("KUBECONFIG_PATH", "")
 MODE            = os.environ.get("MODE", "standalone")
 
+RUNNER_SYNC_INTERVAL = int(os.environ.get("RUNNER_SYNC_INTERVAL", "30"))
+
 SKIP_NS = {
     "kube-system", "kube-public", "kube-node-lease",
     "arc-history", "arc-systems",
@@ -578,6 +580,79 @@ def _cleanup_loop():
             log.error(f"清理历史时出错: {e}")
 
 
+def _sync_ephemeral_runners():
+    if not _k8s_custom:
+        return
+    try:
+        runners = _k8s_custom.list_cluster_custom_object(
+            group="actions.github.com",
+            version="v1alpha1",
+            plural="ephemeralrunners",
+        )
+    except Exception as e:
+        log.error(f"列举 EphemeralRunner 失败: {e}")
+        return
+
+    runner_map = {}
+    for item in runners.get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        ns = item.get("metadata", {}).get("namespace", "")
+        if not name:
+            continue
+        rs = item.get("status", {})
+        rl = item.get("metadata", {}).get("labels", {})
+        info = {
+            "workflow_ref": rs.get("jobWorkflowRef", ""),
+            "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
+            "job_display_name": rs.get("jobDisplayName", ""),
+            "job_id": rs.get("jobId", ""),
+            "job_repository": rs.get("jobRepositoryName", ""),
+            "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
+            "organization": rl.get("actions.github.com/organization", ""),
+            "repository": rl.get("actions.github.com/repository", ""),
+        }
+        info = {k: v for k, v in info.items() if v}
+        runner_map[(ns, name)] = info
+
+    with _db_lock:
+        rows = _db.execute(
+            "SELECT env_id, name, _namespace, extend_env_comments FROM pod_history WHERE status IN ('active', 'provisioning') AND name LIKE '%-workflow'"
+        ).fetchall()
+
+    updated = 0
+    for uid, pod_name, ns, comments_json in rows:
+        runner_name = pod_name[: -len("-workflow")]
+        info = runner_map.get((ns, runner_name))
+        if not info:
+            continue
+        old_comments = {}
+        try:
+            old_comments = json.loads(comments_json or "{}")
+        except Exception:
+            pass
+        if info == old_comments:
+            continue
+        with _db_lock:
+            _db.execute(
+                "UPDATE pod_history SET extend_env_comments = ? WHERE env_id = ?",
+                (json.dumps(info, ensure_ascii=False), uid),
+            )
+            _db.commit()
+        updated += 1
+
+    if updated:
+        log.info(f"EphemeralRunner 同步: 更新 {updated} 条 workflow Pod 信息")
+
+
+def _runner_sync_loop():
+    while True:
+        time.sleep(RUNNER_SYNC_INTERVAL)
+        try:
+            _sync_ephemeral_runners()
+        except Exception as e:
+            log.error(f"EphemeralRunner 同步失败: {e}")
+
+
 # ──────────────────────────────────────────────────────────
 # 3.8.1 查询逻辑（SQL）
 # ──────────────────────────────────────────────────────────
@@ -765,6 +840,7 @@ if __name__ == "__main__":
         _initial_scan()
         threading.Thread(target=_watch_loop, daemon=True, name="watcher").start()
         threading.Thread(target=_flush_loop, daemon=True, name="flush").start()
+        threading.Thread(target=_runner_sync_loop, daemon=True, name="runner-sync").start()
 
     if MODE in ("api", "standalone"):
         threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
