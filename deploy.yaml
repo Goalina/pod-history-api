@@ -1,21 +1,90 @@
 # ============================================================
-# Pod 历史记录服务 — K8s 部署清单（SQLite 存储）
+# Pod 历史记录服务 — K8s 部署清单（PostgreSQL 存储）
 # kubectl apply -f deploy.yaml
 # ============================================================
 
 ---
+# ── PostgreSQL PVC (RWO，仅 PG 自身使用) ──────────────────
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: pod-history-data
+  name: pod-history-pg-data
   namespace: arc-history
 spec:
   accessModes:
-    - ReadWriteMany
-  storageClassName: csi-sfsturbo
+    - ReadWriteOnce
+  storageClassName: csi-disk   # 按集群实际 StorageClass 修改
   resources:
     requests:
-      storage: 100Gi
+      storage: 20Gi
+
+---
+# ── PostgreSQL StatefulSet ─────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pod-history-postgres
+  namespace: arc-history
+spec:
+  serviceName: pod-history-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-postgres
+  template:
+    metadata:
+      labels:
+        app: pod-history-postgres
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: postgres
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "pod_history"
+            - name: POSTGRES_USER
+              value: "pod_history"
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: "trust"
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "pod_history"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pod-history-pg-data
+
+---
+# ── PostgreSQL Service (ClusterIP) ────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-history-postgres
+  namespace: arc-history
+spec:
+  selector:
+    app: pod-history-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -62,7 +131,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: api
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           ports:
             - name: http
@@ -74,11 +143,8 @@ spec:
               value: "8080"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -98,10 +164,6 @@ spec:
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 30
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
 
 ---
 # ── Collector: gy006 (本集群) ──────────────────────────────
@@ -132,7 +194,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -141,11 +203,8 @@ spec:
               value: "gy006"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -153,10 +212,6 @@ spec:
             limits:
               cpu: "500m"
               memory: "256Mi"
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
 
 ---
 # ── Collector: gy003 (远程集群，Vault 注入 kubeconfig) ─────
@@ -199,7 +254,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -210,11 +265,8 @@ spec:
               value: "/vault/secrets/gy003.yaml"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -223,9 +275,6 @@ spec:
               cpu: "500m"
               memory: "256Mi"
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
         - name: token-vol
           projected:
             sources:
@@ -275,7 +324,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -286,11 +335,8 @@ spec:
               value: "/vault/secrets/gy004.yaml"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -299,9 +345,6 @@ spec:
               cpu: "500m"
               memory: "256Mi"
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
         - name: token-vol
           projected:
             sources:
@@ -351,7 +394,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -362,11 +405,8 @@ spec:
               value: "/vault/secrets/gy005.yaml"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -375,9 +415,6 @@ spec:
               cpu: "500m"
               memory: "256Mi"
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
         - name: token-vol
           projected:
             sources:
@@ -427,7 +464,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -438,11 +475,8 @@ spec:
               value: "/vault/secrets/aiframework-hb3.yaml"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -451,9 +485,6 @@ spec:
               cpu: "500m"
               memory: "256Mi"
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
         - name: token-vol
           projected:
             sources:
@@ -503,7 +534,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -514,11 +545,8 @@ spec:
               value: "/vault/secrets/hk001.yaml"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -527,9 +555,6 @@ spec:
               cpu: "500m"
               memory: "256Mi"
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
         - name: token-vol
           projected:
             sources:
@@ -579,7 +604,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:latest
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1802
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -590,11 +615,8 @@ spec:
               value: "/vault/secrets/verl-hb3.yaml"
             - name: RETENTION_DAYS
               value: "30"
-            - name: DB_DIR
-              value: "/data"
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
               cpu: "100m"
@@ -603,9 +625,6 @@ spec:
               cpu: "500m"
               memory: "256Mi"
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pod-history-data
         - name: token-vol
           projected:
             sources:
@@ -613,3 +632,17 @@ spec:
                   audience: api
                   expirationSeconds: 600
                   path: token
+
+---
+# ── API Server Service ─────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: pod-history-api-server
+  namespace: arc-history
+spec:
+  selector:
+    app: pod-history-api-server
+  ports:
+    - port: 8080
+      targetPort: 8080

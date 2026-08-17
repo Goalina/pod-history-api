@@ -3,25 +3,26 @@
 Pod 历史记录服务 — GET /api/v1/envs/history
 符合 resource-deploy-core 3.8.1 规范，支持多集群架构：
 
-  MODE=collector  连目标集群 watch pod，写入 SQLite（/data/{CLUSTER_ID}.db）
-  MODE=api        聚合 /data/*.db 全部集群数据，提供 HTTP 接口
+  MODE=collector  连目标集群 watch pod，写入 PostgreSQL
+  MODE=api        聚合所有集群数据，提供 HTTP 接口
   MODE=standalone 单集群模式（默认，兼容旧部署）
 
-存储：SQLite（/data/{CLUSTER_ID}.db），替代 ConfigMap
-每个 collector 写自己的 db 文件，API 读取所有 db 聚合，无写冲突。
+存储：PostgreSQL（单库多集群，cluster 列区分）
 """
 
 import json
 import logging
 import os
 import re
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 from kubernetes import client as k8s_client, config as k8s_config, watch as k8s_watch
 
 # ──────────────────────────────────────────────────────────
@@ -29,8 +30,8 @@ from kubernetes import client as k8s_client, config as k8s_config, watch as k8s_
 # ──────────────────────────────────────────────────────────
 RETENTION_DAYS  = int(os.environ.get("RETENTION_DAYS", "30"))
 PORT            = int(os.environ.get("PORT", "8080"))
-DB_DIR          = os.environ.get("DB_DIR", "/data")
 FLUSH_INTERVAL  = int(os.environ.get("FLUSH_INTERVAL", "5"))
+DATABASE_URL    = os.environ.get("DATABASE_URL", "")
 
 CLUSTER_ID      = os.environ.get("CLUSTER_ID", "")
 KUBECONFIG_PATH = os.environ.get("KUBECONFIG_PATH", "")
@@ -129,8 +130,10 @@ def now_utc() -> datetime:
 
 
 # ──────────────────────────────────────────────────────────
-# SQLite 存储
+# PostgreSQL 连接池
 # ──────────────────────────────────────────────────────────
+
+_pool: psycopg2.pool.ThreadedConnectionPool = None
 
 _CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS pod_history (
@@ -146,6 +149,8 @@ _CREATE_TABLE_SQL = """
         groups TEXT DEFAULT '{}',
         extend_env_comments TEXT DEFAULT '{}',
         resource_summary TEXT DEFAULT '{}',
+        node_ip TEXT DEFAULT '',
+        npu_list TEXT DEFAULT '[]',
         _namespace TEXT DEFAULT '',
         _node TEXT DEFAULT '',
         _image TEXT DEFAULT '',
@@ -161,49 +166,60 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_name ON pod_history(name)",
 ]
 
+_UPSERT_SQL = """
+    INSERT INTO pod_history
+        (env_id, name, cluster, status, created_at, expires_at, ttl_seconds, duration,
+         wait_duration, groups, extend_env_comments, resource_summary,
+         node_ip, npu_list, _namespace, _node, _image, _exit_code, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (env_id) DO UPDATE SET
+        name = EXCLUDED.name,
+        cluster = EXCLUDED.cluster,
+        status = EXCLUDED.status,
+        created_at = EXCLUDED.created_at,
+        expires_at = EXCLUDED.expires_at,
+        ttl_seconds = EXCLUDED.ttl_seconds,
+        duration = EXCLUDED.duration,
+        wait_duration = EXCLUDED.wait_duration,
+        groups = EXCLUDED.groups,
+        extend_env_comments = EXCLUDED.extend_env_comments,
+        resource_summary = EXCLUDED.resource_summary,
+        node_ip = EXCLUDED.node_ip,
+        npu_list = EXCLUDED.npu_list,
+        _namespace = EXCLUDED._namespace,
+        _node = EXCLUDED._node,
+        _image = EXCLUDED._image,
+        _exit_code = EXCLUDED._exit_code,
+        _updated_at = EXCLUDED._updated_at
+"""
 
-def _db_path_for_collector() -> str:
-    if MODE == "collector" and CLUSTER_ID:
-        return os.path.join(DB_DIR, f"{CLUSTER_ID}.db")
-    return os.path.join(DB_DIR, "pod-history.db")
+
+def _get_conn():
+    return _pool.getconn()
 
 
-def _open_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=DELETE")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute(_CREATE_TABLE_SQL)
-    for idx_sql in _CREATE_INDEXES_SQL:
-        conn.execute(idx_sql)
-    conn.commit()
-    return conn
-
-
-def _discover_dbs() -> list[str]:
-    try:
-        return sorted(
-            os.path.join(DB_DIR, f)
-            for f in os.listdir(DB_DIR)
-            if f.endswith(".db")
-        )
-    except FileNotFoundError:
-        return []
-
-
-_db: sqlite3.Connection = None
-_db_lock = threading.Lock()
+def _put_conn(conn):
+    _pool.putconn(conn)
 
 
 def _init_db():
-    global _db
-    os.makedirs(DB_DIR, exist_ok=True)
-    path = _db_path_for_collector()
-    _db = _open_db(path)
-    log.info(f"SQLite 数据库已初始化: {path}")
+    global _pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL 环境变量未设置")
+    _pool = psycopg2.pool.ThreadedConnectionPool(2, 10, dsn=DATABASE_URL)
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_CREATE_TABLE_SQL)
+            for idx_sql in _CREATE_INDEXES_SQL:
+                cur.execute(idx_sql)
+        conn.commit()
+    finally:
+        _put_conn(conn)
+    log.info(f"PostgreSQL 已连接: {DATABASE_URL.split('@')[-1]}")
 
 
-if MODE in ("collector", "standalone"):
-    _init_db()
+_init_db()
 
 
 # ──────────────────────────────────────────────────────────
@@ -215,8 +231,13 @@ _uid_lock = threading.Lock()
 
 
 def _load_uids_from_db():
-    with _db_lock:
-        rows = _db.execute("SELECT env_id, status FROM pod_history").fetchall()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT env_id, status FROM pod_history WHERE cluster = %s", (CLUSTER_ID,))
+            rows = cur.fetchall()
+    finally:
+        _put_conn(conn)
     with _uid_lock:
         for uid, status in rows:
             if uid:
@@ -270,16 +291,11 @@ def _flush_buffer():
         records = list(_pending_records.values())
         _pending_records.clear()
 
-    with _db_lock:
-        with _db:
-            _db.executemany(
-                """INSERT OR REPLACE INTO pod_history
-                   (env_id, name, cluster, status, created_at, expires_at,
-                    ttl_seconds, duration, wait_duration, groups,
-                    extend_env_comments, resource_summary,
-                    _namespace, _node, _image, _exit_code, _updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [(
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(_UPSERT_SQL, [
+                (
                     r.get("env_id", ""),
                     r.get("name", ""),
                     r.get("cluster", ""),
@@ -292,13 +308,18 @@ def _flush_buffer():
                     json.dumps(r.get("groups", {}), ensure_ascii=False),
                     json.dumps(r.get("extend_env_comments", {}), ensure_ascii=False),
                     json.dumps(r.get("resource_summary", {}), ensure_ascii=False),
+                    r.get("node_ip", ""),
+                    json.dumps(r.get("npu_list", []), ensure_ascii=False),
                     r.get("_namespace", ""),
                     r.get("_node", ""),
                     r.get("_image", ""),
                     r.get("_exit_code"),
                     now_utc().isoformat(),
-                ) for r in records],
-            )
+                ) for r in records
+            ])
+        conn.commit()
+    finally:
+        _put_conn(conn)
     log.info(f"刷盘 {len(records)} 条记录")
 
 
@@ -320,6 +341,35 @@ def _get_exit_code(status) -> int | None:
         if cs.state and cs.state.terminated:
             return cs.state.terminated.exit_code
     return None
+
+
+_NPU_RE = re.compile(r'ascend|npu|gpu', re.IGNORECASE)
+
+
+def _parse_npu(reqs):
+    for key, val in (reqs or {}).items():
+        if _NPU_RE.search(key):
+            try:
+                count = int(str(val))
+            except (ValueError, TypeError):
+                count = 1 if val else 0
+            model = key.split("/")[-1]
+            res_type = "gpu" if "gpu" in key.lower() and "ascend" not in key.lower() else "npu"
+            return count, model, res_type
+    return 0, "", "container"
+
+
+def _parse_npu_list(annotations: dict) -> list:
+    """从 huawei.com/AscendReal 注解提取 NPU 卡号列表，如 'Ascend910-0 Ascend910-1' → ['0', '1']"""
+    val = (annotations or {}).get("huawei.com/AscendReal", "")
+    if not val:
+        return []
+    ids = []
+    for part in re.split(r'[,\s]+', val.strip()):
+        m = re.search(r'(\d+)$', part)
+        if m:
+            ids.append(m.group(1))
+    return ids
 
 
 def _extract_record(pod) -> dict | None:
@@ -368,20 +418,6 @@ def _extract_record(pod) -> dict | None:
     else:
         duration = ""
 
-    _NPU_RE = re.compile(r'ascend|npu|gpu', re.IGNORECASE)
-
-    def _parse_npu(reqs):
-        for key, val in (reqs or {}).items():
-            if _NPU_RE.search(key):
-                try:
-                    count = int(str(val))
-                except (ValueError, TypeError):
-                    count = 1 if val else 0
-                model = key.split("/")[-1]
-                res_type = "gpu" if "gpu" in key.lower() and "ascend" not in key.lower() else "npu"
-                return count, model, res_type
-        return 0, "", "container"
-
     devices = []
     for c in (spec.containers or []):
         res = c.resources
@@ -391,10 +427,10 @@ def _extract_record(pod) -> dict | None:
             cpu = reqs.get("cpu", "")
             mem = reqs.get("memory", "")
         npu, device_model, res_type = _parse_npu(reqs)
-        pool = (spec.node_selector or {}).get("pool", "")
+        pool_label = (spec.node_selector or {}).get("pool", "")
         devices.append({
             "cpu": cpu, "memory": mem, "npu": npu,
-            "pool": pool, "res_type": res_type,
+            "pool": pool_label, "res_type": res_type,
             "device_model": device_model, "group": meta.namespace,
         })
 
@@ -430,6 +466,8 @@ def _extract_record(pod) -> dict | None:
         except Exception as e:
             log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
 
+    annotations = meta.annotations or {}
+
     return {
         "env_id":              meta.uid,
         "name":                meta.name,
@@ -443,6 +481,8 @@ def _extract_record(pod) -> dict | None:
         "groups":              groups,
         "extend_env_comments": extend_env_comments,
         "resource_summary":    resource_summary,
+        "node_ip":             (status.host_ip or "") if status else "",
+        "npu_list":            _parse_npu_list(annotations),
         "_namespace":          meta.namespace,
         "_node":               (spec.node_name or ""),
         "_image":              (spec.containers[0].image if spec.containers else ""),
@@ -495,19 +535,24 @@ def _watch_loop():
                     elif _is_running(uid):
                         new_status = PHASE_TO_STATUS.get(phase)
                         if new_status:
-                            with _db_lock:
-                                row = _db.execute(
-                                    "SELECT status FROM pod_history WHERE env_id = ? ORDER BY created_at DESC LIMIT 1",
-                                    (uid,),
-                                ).fetchone()
-                            if row and row[0] != new_status:
-                                with _db_lock:
-                                    _db.execute(
-                                        "UPDATE pod_history SET status = ? WHERE env_id = ?",
-                                        (new_status, uid),
+                            conn = _get_conn()
+                            try:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        "SELECT status FROM pod_history WHERE env_id = %s",
+                                        (uid,),
                                     )
-                                    _db.commit()
-                                log.info(f"[{new_status}] {ns}/{pod.metadata.name} 状态更新（原 {row[0]}）")
+                                    row = cur.fetchone()
+                                if row and row[0] != new_status:
+                                    with conn.cursor() as cur:
+                                        cur.execute(
+                                            "UPDATE pod_history SET status = %s WHERE env_id = %s",
+                                            (new_status, uid),
+                                        )
+                                    conn.commit()
+                                    log.info(f"[{new_status}] {ns}/{pod.metadata.name} 状态更新（原 {row[0]}）")
+                            finally:
+                                _put_conn(conn)
                     else:
                         record = _extract_record(pod)
                         if record:
@@ -550,38 +595,27 @@ def _initial_scan():
 # 后台线程 2：每天清理过期历史
 # ──────────────────────────────────────────────────────────
 
-def _cleanup_db(conn: sqlite3.Connection, path: str):
+def _cleanup_old_history():
     cutoff = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
     cutoff = datetime.fromtimestamp(
         cutoff.timestamp() - RETENTION_DAYS * 86400,
         tz=timezone.utc,
     )
+    conn = _get_conn()
     try:
-        cur = conn.execute(
-            "DELETE FROM pod_history WHERE created_at < ?",
-            (cutoff.isoformat(),),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM pod_history WHERE created_at < %s",
+                (cutoff.isoformat(),),
+            )
+            deleted = cur.rowcount
         conn.commit()
-        if cur.rowcount:
-            log.info(f"清理 {os.path.basename(path)}: 删除 {cur.rowcount} 条 {cutoff.isoformat()} 之前记录")
+        if deleted:
+            log.info(f"清理历史: 删除 {deleted} 条 {cutoff.isoformat()} 之前记录")
     except Exception as e:
-        log.error(f"清理 {path} 失败: {e}")
-
-
-def _cleanup_old_history():
-    if MODE == "api":
-        for db_path in _discover_dbs():
-            try:
-                conn = _open_db(db_path)
-                try:
-                    _cleanup_db(conn, db_path)
-                finally:
-                    conn.close()
-            except Exception as e:
-                log.error(f"清理 {db_path} 失败: {e}")
-    else:
-        with _db_lock:
-            _cleanup_db(_db, _db_path_for_collector())
+        log.error(f"清理历史失败: {e}")
+    finally:
+        _put_conn(conn)
 
 
 def _cleanup_loop():
@@ -628,34 +662,41 @@ def _sync_ephemeral_runners():
         info = {k: v for k, v in info.items() if v}
         runner_map[(ns, name)] = info
 
-    with _db_lock:
-        rows = _db.execute(
-            "SELECT env_id, name, _namespace, extend_env_comments FROM pod_history WHERE status IN ('active', 'provisioning') AND name LIKE '%-workflow'"
-        ).fetchall()
-
-    updated = 0
-    for uid, pod_name, ns, comments_json in rows:
-        runner_name = pod_name[: -len("-workflow")]
-        info = runner_map.get((ns, runner_name))
-        if not info:
-            continue
-        old_comments = {}
-        try:
-            old_comments = json.loads(comments_json or "{}")
-        except Exception:
-            pass
-        if info == old_comments:
-            continue
-        with _db_lock:
-            _db.execute(
-                "UPDATE pod_history SET extend_env_comments = ? WHERE env_id = ?",
-                (json.dumps(info, ensure_ascii=False), uid),
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT env_id, name, _namespace, extend_env_comments FROM pod_history "
+                "WHERE status IN ('active', 'provisioning') AND name LIKE '%-workflow' AND cluster = %s",
+                (CLUSTER_ID,),
             )
-            _db.commit()
-        updated += 1
+            rows = cur.fetchall()
 
-    if updated:
-        log.info(f"EphemeralRunner 同步: 更新 {updated} 条 workflow Pod 信息")
+        updated = 0
+        for uid, pod_name, ns, comments_json in rows:
+            runner_name = pod_name[: -len("-workflow")]
+            info = runner_map.get((ns, runner_name))
+            if not info:
+                continue
+            old_comments = {}
+            try:
+                old_comments = json.loads(comments_json or "{}")
+            except Exception:
+                pass
+            if info == old_comments:
+                continue
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE pod_history SET extend_env_comments = %s WHERE env_id = %s",
+                    (json.dumps(info, ensure_ascii=False), uid),
+                )
+            updated += 1
+
+        conn.commit()
+        if updated:
+            log.info(f"EphemeralRunner 同步: 更新 {updated} 条 workflow Pod 信息")
+    finally:
+        _put_conn(conn)
 
 
 def _runner_sync_loop():
@@ -677,39 +718,39 @@ def _build_query(start_time: datetime, end_time: datetime,
     conditions = []
     params = []
 
-    ns_placeholders = ",".join("?" for _ in SKIP_NS)
+    ns_placeholders = ",".join("%s" for _ in SKIP_NS)
     conditions.append(f"_namespace NOT IN ({ns_placeholders})")
     params.extend(SKIP_NS)
 
     if match_mode == "created":
-        conditions.append("created_at >= ?")
+        conditions.append("created_at >= %s")
         params.append(start_time.isoformat())
-        conditions.append("created_at <= ?")
+        conditions.append("created_at <= %s")
         params.append(end_time.isoformat())
     elif match_mode == "released":
-        conditions.append("expires_at >= ?")
+        conditions.append("expires_at >= %s")
         params.append(start_time.isoformat())
-        conditions.append("expires_at <= ?")
+        conditions.append("expires_at <= %s")
         params.append(end_time.isoformat())
         conditions.append("expires_at IS NOT NULL")
         conditions.append("expires_at != ''")
     elif match_mode == "overlap":
-        conditions.append("created_at <= ?")
+        conditions.append("created_at <= %s")
         params.append(end_time.isoformat())
-        conditions.append("(expires_at IS NULL OR expires_at = '' OR expires_at >= ?)")
+        conditions.append("(expires_at IS NULL OR expires_at = '' OR expires_at >= %s)")
         params.append(start_time.isoformat())
 
     if status:
-        placeholders = ",".join("?" for _ in status)
+        placeholders = ",".join("%s" for _ in status)
         conditions.append(f"status IN ({placeholders})")
         params.extend(status)
 
     if name_prefix:
-        conditions.append("name LIKE ?")
+        conditions.append("name LIKE %s")
         params.append(f"{name_prefix}%")
 
     if cluster_filter:
-        conditions.append("cluster = ?")
+        conditions.append("cluster = %s")
         params.append(cluster_filter)
 
     where = " AND ".join(conditions)
@@ -717,17 +758,20 @@ def _build_query(start_time: datetime, end_time: datetime,
     return sql, params
 
 
+_JSON_FIELDS = ("groups", "extend_env_comments", "resource_summary", "npu_list")
+
+
 def _rows_to_records(rows, col_names) -> list:
     now = now_utc()
     result = []
     for row in rows:
         r = dict(zip(col_names, row))
-        for json_field in ("groups", "extend_env_comments", "resource_summary"):
+        for json_field in _JSON_FIELDS:
             if r.get(json_field):
                 try:
                     r[json_field] = json.loads(r[json_field])
                 except (json.JSONDecodeError, TypeError):
-                    r[json_field] = {}
+                    r[json_field] = [] if json_field == "npu_list" else {}
         if r.get("status") in ("active", "provisioning") and r.get("created_at"):
             r_created = parse_iso(r["created_at"])
             if r_created:
@@ -747,25 +791,15 @@ def query_history(start_time: datetime, end_time: datetime,
 
     sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter)
 
-    if MODE == "api":
-        all_results = []
-        for db_path in _discover_dbs():
-            try:
-                conn = _open_db(db_path)
-                try:
-                    rows = conn.execute(sql, params).fetchall()
-                    col_names = [d[0] for d in conn.execute("SELECT * FROM pod_history LIMIT 0").description]
-                    all_results.extend(_rows_to_records(rows, col_names))
-                finally:
-                    conn.close()
-            except Exception as e:
-                log.error(f"查询 {db_path} 失败: {e}")
-        all_results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        return all_results
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            col_names = [d[0] for d in cur.description]
+    finally:
+        _put_conn(conn)
 
-    with _db_lock:
-        rows = _db.execute(sql, params).fetchall()
-        col_names = [d[0] for d in _db.execute("SELECT * FROM pod_history LIMIT 0").description]
     return _rows_to_records(rows, col_names)
 
 
