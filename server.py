@@ -667,7 +667,7 @@ def _sync_ephemeral_runners():
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT env_id, name, _namespace, extend_env_comments FROM pod_history "
-                "WHERE status IN ('active', 'provisioning') AND name LIKE '%-workflow' AND cluster = %s",
+                "WHERE status IN ('active', 'provisioning') AND name LIKE '%%-workflow' AND cluster = %s",
                 (CLUSTER_ID,),
             )
             rows = cur.fetchall()
