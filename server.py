@@ -198,7 +198,12 @@ def _get_conn():
     return _pool.getconn()
 
 
-def _put_conn(conn):
+def _put_conn(conn, error=False):
+    if error:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     _pool.putconn(conn)
 
 
@@ -236,7 +241,11 @@ def _load_uids_from_db():
         with conn.cursor() as cur:
             cur.execute("SELECT env_id, status FROM pod_history WHERE cluster = %s", (CLUSTER_ID,))
             rows = cur.fetchall()
-    finally:
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
         _put_conn(conn)
     with _uid_lock:
         for uid, status in rows:
@@ -318,7 +327,10 @@ def _flush_buffer():
                 ) for r in records
             ])
         conn.commit()
-    finally:
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
         _put_conn(conn)
     log.info(f"刷盘 {len(records)} 条记录")
 
@@ -551,7 +563,12 @@ def _watch_loop():
                                         )
                                     conn.commit()
                                     log.info(f"[{new_status}] {ns}/{pod.metadata.name} 状态更新（原 {row[0]}）")
-                            finally:
+                                else:
+                                    conn.commit()
+                            except Exception:
+                                _put_conn(conn, error=True)
+                                raise
+                            else:
                                 _put_conn(conn)
                     else:
                         record = _extract_record(pod)
@@ -614,8 +631,9 @@ def _cleanup_old_history():
             log.info(f"清理历史: 删除 {deleted} 条 {cutoff.isoformat()} 之前记录")
     except Exception as e:
         log.error(f"清理历史失败: {e}")
-    finally:
-        _put_conn(conn)
+        _put_conn(conn, error=True)
+        return
+    _put_conn(conn)
 
 
 def _cleanup_loop():
@@ -695,7 +713,10 @@ def _sync_ephemeral_runners():
         conn.commit()
         if updated:
             log.info(f"EphemeralRunner 同步: 更新 {updated} 条 workflow Pod 信息")
-    finally:
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
         _put_conn(conn)
 
 
@@ -797,7 +818,11 @@ def query_history(start_time: datetime, end_time: datetime,
             cur.execute(sql, params)
             rows = cur.fetchall()
             col_names = [d[0] for d in cur.description]
-    finally:
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
         _put_conn(conn)
 
     return _rows_to_records(rows, col_names)
