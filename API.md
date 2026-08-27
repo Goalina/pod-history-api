@@ -237,7 +237,6 @@
 | 页面 | URL 拼接方式 | 示例 |
 |---|---|---|
 | **Workflow Run 详情** | `https://github.com/{repository}/actions/runs/{workflow_run_id}` | `https://github.com/my-org/my-repo/actions/runs/12345678901` |
-| **Job 详情** | `https://github.com/{repository}/actions/runs/{workflow_run_id}/job/{job_id}` | `https://github.com/my-org/my-repo/actions/runs/12345678901/job/42` |
 | **工作流文件** | `https://github.com/{workflow_ref}` | `https://github.com/my-org/my-repo/.github/workflows/ci.yml@refs/heads/main` |
 | **仓库首页** | `https://github.com/{repository}` | `https://github.com/my-org/my-repo` |
 
@@ -247,14 +246,11 @@
 def build_github_urls(comments: dict) -> dict:
     repo = comments.get("repository", "")
     run_id = comments.get("workflow_run_id", "")
-    job_id = comments.get("job_id", "")
     workflow_ref = comments.get("workflow_ref", "")
 
     urls = {}
     if repo and run_id:
         urls["workflow_run_url"] = f"https://github.com/{repo}/actions/runs/{run_id}"
-    if repo and run_id and job_id:
-        urls["job_url"] = f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
     if workflow_ref:
         urls["workflow_file_url"] = f"https://github.com/{workflow_ref}"
     if repo:
@@ -264,12 +260,10 @@ def build_github_urls(comments: dict) -> dict:
 
 ```javascript
 function buildGithubUrls(comments) {
-  const { repository, workflow_run_id, job_id, workflow_ref } = comments;
+  const { repository, workflow_run_id, workflow_ref } = comments;
   const urls = {};
   if (repository && workflow_run_id)
     urls.workflow_run_url = `https://github.com/${repository}/actions/runs/${workflow_run_id}`;
-  if (repository && workflow_run_id && job_id)
-    urls.job_url = `https://github.com/${repository}/actions/runs/${workflow_run_id}/job/${job_id}`;
   if (workflow_ref)
     urls.workflow_file_url = `https://github.com/${workflow_ref}`;
   if (repository)
