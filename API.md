@@ -324,20 +324,22 @@ function buildGithubUrls(comments) {
 
 ### 常见查询示例
 
+服务域名：`pod-history-api.test.osinfra.cn`
+
 ```bash
 # 查询今天所有已终止的 Pod
-curl "http://localhost:8080/api/v1/envs/history?\
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-27T00:00:00Z&end_time=2026-08-27T23:59:59Z&status=released&status=rejected"
 
 # 查询某个时间点正在运行的 Pod（overlap 模式）
-curl "http://localhost:8080/api/v1/envs/history?\
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-27T10:00:00Z&end_time=2026-08-27T10:00:00Z&match_mode=overlap"
 
 # 按集群过滤
-curl "http://localhost:8080/api/v1/envs/history?\
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&cluster=gy006"
 
 # 按 Pod 名称前缀过滤
-curl "http://localhost:8080/api/v1/envs/history?\
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&name_prefix=my-job-"
 ```
