@@ -131,7 +131,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: api
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           ports:
             - name: http
@@ -194,7 +194,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -254,7 +254,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -324,7 +324,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -394,7 +394,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -464,7 +464,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -534,7 +534,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -604,7 +604,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260817-1845
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
           imagePullPolicy: Always
           env:
             - name: MODE
