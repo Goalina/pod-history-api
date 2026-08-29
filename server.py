@@ -581,7 +581,11 @@ def _watch_loop():
                         record = _extract_record(pod)
                         if record:
                             _buffer_record(record)
-                            _mark_running(uid)
+                            # Only mark_running for truly Running pods; Pending pods
+                            # must not be marked so the next MODIFIED→Running event
+                            # re-enters this branch and updates created_at to start_time.
+                            if phase == "Running":
+                                _mark_running(uid)
 
         except Exception as e:
             log.error(f"Pod watcher 异常，5s 后重启: {e}")
