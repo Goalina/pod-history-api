@@ -538,12 +538,19 @@ def _watch_loop():
 
                 elif phase in RUNNING_PHASES:
                     if etype == "DELETED":
-                        record = _extract_record(pod)
-                        if record:
-                            record["status"]     = "expired"
-                            record["expires_at"] = now_utc().isoformat()
-                            _buffer_record(record)
-                            _mark_terminal(uid)
+                        if not _is_terminal(uid):
+                            record = _extract_record(pod)
+                            if record:
+                                now = now_utc()
+                                record["status"]     = "expired"
+                                record["expires_at"] = now.isoformat()
+                                created_dt = parse_iso(record.get("created_at", ""))
+                                if created_dt:
+                                    elapsed = max(0, int((now - created_dt).total_seconds()))
+                                    record["ttl_seconds"] = elapsed
+                                    record["duration"]    = format_duration(elapsed)
+                                _buffer_record(record)
+                                _mark_terminal(uid)
                     elif _is_running(uid):
                         new_status = PHASE_TO_STATUS.get(phase)
                         if new_status:
