@@ -252,7 +252,11 @@ def _load_uids_from_db():
             if uid:
                 if status in ("released", "rejected", "expired"):
                     _terminal_uids.add(uid)
-                else:
+                elif status == "active":
+                    # Only truly-running pods go into _running_uids.
+                    # provisioning (Pending) pods are intentionally excluded so
+                    # the watch MODIFIED→Running event can re-record them with
+                    # the correct start_time as created_at.
                     _running_uids.add(uid)
     log.info(f"从数据库加载 {len(_terminal_uids)} 条终态 UID, {len(_running_uids)} 条运行中 UID")
 
