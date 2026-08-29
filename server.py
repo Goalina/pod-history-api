@@ -406,7 +406,7 @@ def _extract_record(pod) -> dict | None:
                 end_time = cs.state.terminated.finished_at
                 break
 
-    created_at = start_time or creation_ts
+    created_at = start_time  # None for Pending pods; creation_ts is NOT used as fallback
     expires_at = (end_time or now_utc()) if is_terminal else None
 
     ttl_seconds = 0
@@ -608,7 +608,11 @@ def _initial_scan():
             record = _extract_record(pod)
             if record:
                 _buffer_record(record)
-                _mark_running(pod.metadata.uid)
+                # Only mark_running for truly Running pods; Pending pods must NOT be
+                # marked here so the MODIFIED→Running event can re-record them with
+                # the correct start_time (created_at).
+                if phase == "Running":
+                    _mark_running(pod.metadata.uid)
                 count += 1
         log.info(f"初始扫描完成，缓冲 {count} 条运行中记录")
     except Exception as e:
@@ -763,6 +767,8 @@ def _build_query(start_time: datetime, end_time: datetime,
         conditions.append("expires_at IS NOT NULL")
         conditions.append("expires_at != ''")
     elif match_mode == "overlap":
+        # Exclude pods that never left Pending (created_at is empty when start_time was None)
+        conditions.append("created_at != ''")
         conditions.append("created_at <= %s")
         params.append(end_time.isoformat())
         conditions.append("(expires_at IS NULL OR expires_at = '' OR expires_at >= %s)")
