@@ -634,6 +634,76 @@ spec:
                   path: token
 
 ---
+# ── Collector: cn12-001 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-cn12-001
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-cn12-001
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-cn12.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-cn12.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-cn12.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.cn12 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-cn12-001
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20260829-1103
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "cn12-001"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/cn12.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
 # ── API Server Service ─────────────────────────────────────
 apiVersion: v1
 kind: Service
