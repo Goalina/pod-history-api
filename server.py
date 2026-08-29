@@ -302,7 +302,7 @@ def _flush_buffer():
         if not _pending_records:
             return
         records = list(_pending_records.values())
-        _pending_records.clear()
+        # Bug 1 fix: do NOT clear here; clear only after successful commit.
 
     conn = _get_conn()
     try:
@@ -336,6 +336,13 @@ def _flush_buffer():
         raise
     else:
         _put_conn(conn)
+        # Clear only after successful commit so records survive DB exceptions.
+        with _pending_lock:
+            for r in records:
+                uid = r.get("env_id", "")
+                # Only remove if still the same record (not superseded by a newer event).
+                if uid and _pending_records.get(uid) is r:
+                    del _pending_records[uid]
     log.info(f"刷盘 {len(records)} 条记录")
 
 
@@ -576,12 +583,18 @@ def _watch_loop():
                                     log.info(f"[{new_status}] {ns}/{pod.metadata.name} 状态更新（原 {row[0]}）")
                                 else:
                                     conn.commit()
-                            except Exception:
+                            except Exception as _db_err:
+                                # Bug 2 fix: DB error in status update must not restart the
+                                # entire watch stream; log and continue to the next event.
                                 _put_conn(conn, error=True)
-                                raise
+                                log.warning(f"状态更新失败 {uid}: {_db_err}")
                             else:
                                 _put_conn(conn)
                     else:
+                        # Bug 3 fix: skip pods already in terminal state to avoid
+                        # re-writing "active"/"provisioning" on watcher reconnect replay.
+                        if _is_terminal(uid):
+                            continue
                         record = _extract_record(pod)
                         if record:
                             _buffer_record(record)
@@ -709,7 +722,9 @@ def _sync_ephemeral_runners():
             )
             rows = cur.fetchall()
 
-        updated = 0
+        # Bug 4 fix: collect all updates first, then executemany in one shot to
+        # minimise how long the connection is held.
+        updates = []
         for uid, pod_name, ns, comments_json in rows:
             runner_name = pod_name[: -len("-workflow")]
             info = runner_map.get((ns, runner_name))
@@ -722,13 +737,15 @@ def _sync_ephemeral_runners():
                 pass
             if info == old_comments:
                 continue
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE pod_history SET extend_env_comments = %s WHERE env_id = %s",
-                    (json.dumps(info, ensure_ascii=False), uid),
-                )
-            updated += 1
+            updates.append((json.dumps(info, ensure_ascii=False), uid))
 
+        updated = len(updates)
+        if updates:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE pod_history SET extend_env_comments = %s WHERE env_id = %s",
+                    updates,
+                )
         conn.commit()
         if updated:
             log.info(f"EphemeralRunner 同步: 更新 {updated} 条 workflow Pod 信息")
@@ -809,7 +826,9 @@ def _rows_to_records(rows, col_names) -> list:
     for row in rows:
         r = dict(zip(col_names, row))
         for json_field in _JSON_FIELDS:
-            if r.get(json_field):
+            # Bug 6 fix: use 'is not None' so empty string "" is also parsed
+            # (truthy check skips "" and causes clients to receive a raw string).
+            if r.get(json_field) is not None:
                 try:
                     r[json_field] = json.loads(r[json_field])
                 except (json.JSONDecodeError, TypeError):
@@ -829,7 +848,12 @@ def query_history(start_time: datetime, end_time: datetime,
                   name_prefix: str = None,
                   cluster_filter: str = None) -> list:
     if MODE in ("collector", "standalone"):
-        _flush_buffer()
+        try:
+            _flush_buffer()
+        except Exception as _flush_err:
+            # Bug 5 fix: flush failure must not abort the query or reset the TCP
+            # connection; the HTTP client would get no response at all.
+            log.warning(f"query_history 前 flush 失败（忽略）: {_flush_err}")
 
     sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter)
 
