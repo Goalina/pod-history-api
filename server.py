@@ -690,78 +690,84 @@ def _reconcile():
     if not db_records:
         return
 
-    # 2. 获取 K8s 当前所有 Pod UID
+    # 2. 获取 K8s 当前所有 Pod：live_uids 只含 Running/Pending（真正在跑的）；
+    #    all_by_uid 含全部（包括 Succeeded/Failed 但尚未 GC 的），用于读取 finishedAt。
     try:
         pods = _k8s_core.list_pod_for_all_namespaces()
-        live_uids = {pod.metadata.uid for pod in pods.items}
+        live_uids  = {p.metadata.uid for p in pods.items
+                      if p.status and p.status.phase in RUNNING_PHASES}
+        all_by_uid = {p.metadata.uid: p for p in pods.items}
     except Exception as e:
         log.error(f"[对账] 获取 K8s pod 列表失败，跳过: {e}")
         return
 
     now = now_utc()
-    expired_count = 0
-    conn = _get_conn()
-    try:
-        for env_id, name, namespace, created_at_str, updated_at_str in db_records:
-            if env_id in live_uids:
-                continue  # pod 仍在运行，无需处理
+    _max_downtime = timedelta(seconds=_WATCHER_IDLE_MAX + 120)
+    updates   = []  # (expires_at, ttl_seconds, duration, now_iso, env_id)
+    log_lines = []
 
-            # 尝试从 K8s 读取真实终止时间（pod 可能还未被 GC）
-            finished_at = None
-            if namespace and name:
-                try:
-                    pod = _k8s_core.read_namespaced_pod(name=name, namespace=namespace)
-                    for cs in (pod.status.container_statuses or []):
-                        if cs.state and cs.state.terminated and cs.state.terminated.finished_at:
-                            ft = cs.state.terminated.finished_at
-                            finished_at = ft if ft.tzinfo else ft.replace(tzinfo=timezone.utc)
-                            break
-                except Exception:
-                    pass  # pod 已被 GC 或无权读取，用兜底
+    for env_id, name, namespace, created_at_str, updated_at_str in db_records:
+        if env_id in live_uids:
+            continue  # pod 仍在运行，无需处理
 
-            # expires_at：真实终止时间，或 max(_updated_at, now - watchdog窗口) 兜底。
-            # watchdog 保证进程在 _WATCHER_IDLE_MAX+120s 内必然重启，
-            # 所以 now - 该窗口 是比 _updated_at+30min 更精确的估算上界。
-            _max_downtime = timedelta(seconds=_WATCHER_IDLE_MAX + 120)
-            if finished_at:
-                expires_at = finished_at
-            else:
-                try:
-                    updated_at = parse_iso(str(updated_at_str))
-                    expires_at = max(updated_at, now - _max_downtime) if updated_at else now - _max_downtime
-                except Exception:
-                    expires_at = now - _max_downtime
+        # 从已拉取的列表中查找终止时间，不额外发起 API 请求
+        finished_at = None
+        existing_pod = all_by_uid.get(env_id)
+        if existing_pod:
+            for cs in (existing_pod.status.container_statuses or []):
+                if cs.state and cs.state.terminated and cs.state.terminated.finished_at:
+                    ft = cs.state.terminated.finished_at
+                    finished_at = ft if ft.tzinfo else ft.replace(tzinfo=timezone.utc)
+                    break
 
-            # 重算 ttl_seconds / duration
-            ttl_seconds = 0
-            duration = ""
-            if created_at_str:
-                created_dt = parse_iso(str(created_at_str))
-                if created_dt:
-                    ttl_seconds = max(0, int((expires_at - created_dt).total_seconds()))
-                    duration = format_duration(ttl_seconds)
-
+        # expires_at：真实终止时间，或 max(_updated_at, now - watchdog窗口) 兜底。
+        if finished_at:
+            expires_at = finished_at
+        else:
             try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE pod_history "
-                        "SET status='expired', expires_at=%s, ttl_seconds=%s, duration=%s, _updated_at=%s "
-                        "WHERE env_id=%s",
-                        (expires_at.isoformat(), ttl_seconds, duration, now.isoformat(), env_id),
-                    )
-                conn.commit()
-                _mark_terminal(env_id)
-                expired_count += 1
-                source = "K8s finishedAt" if finished_at else "max(_updated_at, now-watchdog窗口)"
-                log.info(f"[对账] {namespace}/{name} → expired (expires_at={expires_at.isoformat()[:19]}, 来源={source})")
-            except Exception as e:
-                log.warning(f"[对账] 更新 {env_id} 失败: {e}")
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-    finally:
-        _put_conn(conn)
+                updated_at = parse_iso(str(updated_at_str))
+                expires_at = max(updated_at, now - _max_downtime) if updated_at else now - _max_downtime
+            except Exception:
+                expires_at = now - _max_downtime
+
+        ttl_seconds = 0
+        duration = ""
+        if created_at_str:
+            created_dt = parse_iso(str(created_at_str))
+            if created_dt:
+                ttl_seconds = max(0, int((expires_at - created_dt).total_seconds()))
+                duration = format_duration(ttl_seconds)
+
+        updates.append((expires_at.isoformat(), ttl_seconds, duration, now.isoformat(), env_id))
+        _mark_terminal(env_id)
+        source = "K8s finishedAt" if finished_at else "max(_updated_at, now-watchdog窗口)"
+        log_lines.append(
+            f"[对账] {namespace}/{name} → expired "
+            f"(expires_at={expires_at.isoformat()[:19]}, 来源={source})"
+        )
+
+    expired_count = len(updates)
+    if updates:
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE pod_history "
+                    "SET status='expired', expires_at=%s, ttl_seconds=%s, duration=%s, _updated_at=%s "
+                    "WHERE env_id=%s",
+                    updates,
+                )
+            conn.commit()
+            for line in log_lines:
+                log.info(line)
+        except Exception as e:
+            log.warning(f"[对账] 批量更新失败: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            _put_conn(conn)
 
     if expired_count:
         log.info(f"[对账] 完成：{expired_count}/{len(db_records)} 条记录标记为 expired")
