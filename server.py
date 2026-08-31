@@ -234,6 +234,12 @@ _running_uids: set = set()
 _terminal_uids: set = set()
 _uid_lock = threading.Lock()
 
+# ──────────────────────────────────────────────────────────
+# Watcher 心跳（watchdog 用）
+# ──────────────────────────────────────────────────────────
+_WATCHER_IDLE_MAX   = 400   # 超过此秒数无心跳则视为卡死
+_watcher_heartbeat  = time.monotonic()
+
 
 def _load_uids_from_db():
     conn = _get_conn()
@@ -518,14 +524,19 @@ def _extract_record(pod) -> dict | None:
 # ──────────────────────────────────────────────────────────
 
 def _watch_loop():
+    global _watcher_heartbeat
     log.info(f"Pod watcher 启动，监听集群 [{CLUSTER_ID or 'local'}] 所有 namespace …")
+    retry_delay = 5
     while True:
+        _watcher_heartbeat = time.monotonic()
         try:
             w = k8s_watch.Watch()
+            log.info(f"Pod watcher 已连接，开始监听事件 …")
             for event in w.stream(
                 _k8s_core.list_pod_for_all_namespaces,
                 timeout_seconds=300,
             ):
+                _watcher_heartbeat = time.monotonic()
                 etype = event["type"]
                 pod   = event["object"]
                 ns    = pod.metadata.namespace
@@ -604,9 +615,24 @@ def _watch_loop():
                             if phase == "Running":
                                 _mark_running(uid)
 
+            # stream 正常超时结束，立即重连（无需等待）
+            log.info("Pod watcher 流超时，重新连接 …")
+            retry_delay = 5
+
         except Exception as e:
-            log.error(f"Pod watcher 异常，5s 后重启: {e}")
-            time.sleep(5)
+            log.error(f"Pod watcher 异常 (将在 {retry_delay}s 后重连): {e}")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+
+def _watcher_watchdog():
+    """监控 watcher 心跳，超时则重启进程（由 K8s 自动拉起）。"""
+    while True:
+        time.sleep(60)
+        idle = time.monotonic() - _watcher_heartbeat
+        if idle > _WATCHER_IDLE_MAX:
+            log.error(f"Pod watcher 心跳超时 ({int(idle)}s 无活动)，重启进程 …")
+            os._exit(1)
 
 
 # ──────────────────────────────────────────────────────────
@@ -957,6 +983,7 @@ if __name__ == "__main__":
         _load_uids_from_db()
         _initial_scan()
         threading.Thread(target=_watch_loop, daemon=True, name="watcher").start()
+        threading.Thread(target=_watcher_watchdog, daemon=True, name="watcher-watchdog").start()
         threading.Thread(target=_flush_loop, daemon=True, name="flush").start()
         threading.Thread(target=_runner_sync_loop, daemon=True, name="runner-sync").start()
 
