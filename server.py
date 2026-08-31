@@ -663,7 +663,8 @@ def _watcher_watchdog():
 def _reconcile():
     """对账 DB 与 K8s 实际状态：将 K8s 中已不存在的 active/provisioning 记录标为 expired。
 
-    每次 watcher 重连前调用，覆盖所有宕机/重连场景。
+    仅在 _last_resource_version 为空时调用（进程重启、410 Gone 后），有断点时由
+    resourceVersion 回放保证事件完整性，无需额外对账。
     """
     if not CLUSTER_ID:
         return
@@ -713,7 +714,7 @@ def _reconcile():
         # 从已拉取的列表中查找终止时间，不额外发起 API 请求
         finished_at = None
         existing_pod = all_by_uid.get(env_id)
-        if existing_pod:
+        if existing_pod and existing_pod.status:
             for cs in (existing_pod.status.container_statuses or []):
                 if cs.state and cs.state.terminated and cs.state.terminated.finished_at:
                     ft = cs.state.terminated.finished_at
