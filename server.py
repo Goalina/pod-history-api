@@ -529,8 +529,10 @@ def _watch_loop():
     log.info(f"Pod watcher 启动，监听集群 [{CLUSTER_ID or 'local'}] 所有 namespace …")
     retry_delay = 5
     while True:
-        # 每次（重）连接前对账，覆盖宕机/重连期间漏采的 DELETED 事件
-        _reconcile()
+        # 无断点时才对账：进程重启、410 Gone 后 resourceVersion 为空，
+        # 说明有事件遗漏；有断点时 K8s 会通过 resourceVersion 回放所有漏采事件。
+        if not _last_resource_version:
+            _reconcile()
         try:
             w = k8s_watch.Watch()
             kwargs = {"timeout_seconds": 300}
