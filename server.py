@@ -16,7 +16,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -233,6 +233,13 @@ _init_db()
 _running_uids: set = set()
 _terminal_uids: set = set()
 _uid_lock = threading.Lock()
+
+# ──────────────────────────────────────────────────────────
+# Watcher 心跳（watchdog 用）
+# ──────────────────────────────────────────────────────────
+_WATCHER_IDLE_MAX        = 400   # 超过此秒数无心跳则视为卡死
+_watcher_heartbeat       = time.monotonic()
+_last_resource_version   = None  # 断点续传：上次成功处理的 resourceVersion
 
 
 def _load_uids_from_db():
@@ -518,14 +525,33 @@ def _extract_record(pod) -> dict | None:
 # ──────────────────────────────────────────────────────────
 
 def _watch_loop():
+    global _watcher_heartbeat, _last_resource_version
     log.info(f"Pod watcher 启动，监听集群 [{CLUSTER_ID or 'local'}] 所有 namespace …")
+    retry_delay = 5
     while True:
+        # 无断点时才对账：进程重启、410 Gone 后 resourceVersion 为空，
+        # 说明有事件遗漏；有断点时 K8s 会通过 resourceVersion 回放所有漏采事件。
+        if not _last_resource_version:
+            _reconcile()
         try:
             w = k8s_watch.Watch()
+            kwargs = {"timeout_seconds": 300}
+            if _last_resource_version:
+                kwargs["resource_version"] = _last_resource_version
+                log.info(f"Pod watcher 断点续传，resourceVersion={_last_resource_version} …")
+            else:
+                log.info("Pod watcher 全量连接，开始监听事件 …")
+            # 心跳仅在成功建立连接后刷新，确保连接失败时 watchdog 能触发
+            _watcher_heartbeat = time.monotonic()
             for event in w.stream(
                 _k8s_core.list_pod_for_all_namespaces,
-                timeout_seconds=300,
+                **kwargs,
             ):
+                _watcher_heartbeat = time.monotonic()
+                # 持续更新 resourceVersion，断线后可从断点续传
+                rv = event["object"].metadata.resource_version
+                if rv:
+                    _last_resource_version = rv
                 etype = event["type"]
                 pod   = event["object"]
                 ns    = pod.metadata.namespace
@@ -604,9 +630,148 @@ def _watch_loop():
                             if phase == "Running":
                                 _mark_running(uid)
 
+            # stream 正常超时结束，立即重连（无需等待）
+            log.info("Pod watcher 流超时，重新连接 …")
+            retry_delay = 5
+
         except Exception as e:
-            log.error(f"Pod watcher 异常，5s 后重启: {e}")
-            time.sleep(5)
+            # resourceVersion 过期（410 Gone）：丢弃断点，下次全量重连
+            if "410" in str(e) or "Gone" in str(e) or "too old" in str(e).lower():
+                log.warning(f"Pod watcher resourceVersion 已过期，将全量重连: {e}")
+                _last_resource_version = None
+            else:
+                log.error(f"Pod watcher 异常 (将在 {retry_delay}s 后重连): {e}")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+            # 注意：此处不刷新心跳，连接持续失败时 watchdog 将在 400s 后触发重启
+
+
+def _watcher_watchdog():
+    """监控 watcher 心跳，超时则重启进程（由 K8s 自动拉起）。"""
+    while True:
+        time.sleep(60)
+        idle = time.monotonic() - _watcher_heartbeat
+        if idle > _WATCHER_IDLE_MAX:
+            log.error(f"Pod watcher 心跳超时 ({int(idle)}s 无活动)，重启进程 …")
+            os._exit(1)
+
+
+# ──────────────────────────────────────────────────────────
+# 对账：清理 DB 中已消失 Pod 的僵尸 active 记录
+# ──────────────────────────────────────────────────────────
+
+def _reconcile():
+    """对账 DB 与 K8s 实际状态：将 K8s 中已不存在的 active/provisioning 记录标为 expired。
+
+    仅在 _last_resource_version 为空时调用（进程重启、410 Gone 后），有断点时由
+    resourceVersion 回放保证事件完整性，无需额外对账。
+    """
+    if not CLUSTER_ID:
+        return
+
+    log.info(f"启动对账：检查集群 [{CLUSTER_ID}] 中僵尸 active 记录 …")
+
+    # 1. 从 DB 拉出该集群所有 active/provisioning 记录
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT env_id, name, _namespace, created_at, _updated_at "
+                "FROM pod_history "
+                "WHERE cluster = %s AND status IN ('active', 'provisioning')",
+                (CLUSTER_ID,),
+            )
+            db_records = cur.fetchall()
+    except Exception as e:
+        log.error(f"[对账] 查询 DB 失败: {e}")
+        _put_conn(conn, error=True)
+        return
+    _put_conn(conn)
+
+    if not db_records:
+        return
+
+    # 2. 获取 K8s 当前所有 Pod：live_uids 只含 Running/Pending（真正在跑的）；
+    #    all_by_uid 含全部（包括 Succeeded/Failed 但尚未 GC 的），用于读取 finishedAt。
+    try:
+        pods = _k8s_core.list_pod_for_all_namespaces()
+        live_uids  = {p.metadata.uid for p in pods.items
+                      if p.status and p.status.phase in RUNNING_PHASES}
+        all_by_uid = {p.metadata.uid: p for p in pods.items}
+    except Exception as e:
+        log.error(f"[对账] 获取 K8s pod 列表失败，跳过: {e}")
+        return
+
+    now = now_utc()
+    _max_downtime = timedelta(seconds=_WATCHER_IDLE_MAX + 120)
+    updates   = []  # (expires_at, ttl_seconds, duration, now_iso, env_id)
+    log_lines = []
+
+    for env_id, name, namespace, created_at_str, updated_at_str in db_records:
+        if env_id in live_uids:
+            continue  # pod 仍在运行，无需处理
+
+        # 从已拉取的列表中查找终止时间，不额外发起 API 请求
+        finished_at = None
+        existing_pod = all_by_uid.get(env_id)
+        if existing_pod and existing_pod.status:
+            for cs in (existing_pod.status.container_statuses or []):
+                if cs.state and cs.state.terminated and cs.state.terminated.finished_at:
+                    ft = cs.state.terminated.finished_at
+                    finished_at = ft if ft.tzinfo else ft.replace(tzinfo=timezone.utc)
+                    break
+
+        # expires_at：真实终止时间，或 max(_updated_at, now - watchdog窗口) 兜底。
+        if finished_at:
+            expires_at = finished_at
+        else:
+            try:
+                updated_at = parse_iso(str(updated_at_str))
+                expires_at = max(updated_at, now - _max_downtime) if updated_at else now - _max_downtime
+            except Exception:
+                expires_at = now - _max_downtime
+
+        ttl_seconds = 0
+        duration = ""
+        if created_at_str:
+            created_dt = parse_iso(str(created_at_str))
+            if created_dt:
+                ttl_seconds = max(0, int((expires_at - created_dt).total_seconds()))
+                duration = format_duration(ttl_seconds)
+
+        updates.append((expires_at.isoformat(), ttl_seconds, duration, now.isoformat(), env_id))
+        _mark_terminal(env_id)
+        source = "K8s finishedAt" if finished_at else "max(_updated_at, now-watchdog窗口)"
+        log_lines.append(
+            f"[对账] {namespace}/{name} → expired "
+            f"(expires_at={expires_at.isoformat()[:19]}, 来源={source})"
+        )
+
+    expired_count = len(updates)
+    if updates:
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE pod_history "
+                    "SET status='expired', expires_at=%s, ttl_seconds=%s, duration=%s, _updated_at=%s "
+                    "WHERE env_id=%s",
+                    updates,
+                )
+            conn.commit()
+            for line in log_lines:
+                log.info(line)
+        except Exception as e:
+            log.warning(f"[对账] 批量更新失败: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            _put_conn(conn)
+
+    if expired_count:
+        log.info(f"[对账] 完成：{expired_count}/{len(db_records)} 条记录标记为 expired")
 
 
 # ──────────────────────────────────────────────────────────
@@ -957,6 +1122,7 @@ if __name__ == "__main__":
         _load_uids_from_db()
         _initial_scan()
         threading.Thread(target=_watch_loop, daemon=True, name="watcher").start()
+        threading.Thread(target=_watcher_watchdog, daemon=True, name="watcher-watchdog").start()
         threading.Thread(target=_flush_loop, daemon=True, name="flush").start()
         threading.Thread(target=_runner_sync_loop, daemon=True, name="runner-sync").start()
 
