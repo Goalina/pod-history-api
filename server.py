@@ -237,8 +237,9 @@ _uid_lock = threading.Lock()
 # ──────────────────────────────────────────────────────────
 # Watcher 心跳（watchdog 用）
 # ──────────────────────────────────────────────────────────
-_WATCHER_IDLE_MAX   = 400   # 超过此秒数无心跳则视为卡死
-_watcher_heartbeat  = time.monotonic()
+_WATCHER_IDLE_MAX        = 400   # 超过此秒数无心跳则视为卡死
+_watcher_heartbeat       = time.monotonic()
+_last_resource_version   = None  # 断点续传：上次成功处理的 resourceVersion
 
 
 def _load_uids_from_db():
@@ -524,19 +525,31 @@ def _extract_record(pod) -> dict | None:
 # ──────────────────────────────────────────────────────────
 
 def _watch_loop():
-    global _watcher_heartbeat
+    global _watcher_heartbeat, _last_resource_version
     log.info(f"Pod watcher 启动，监听集群 [{CLUSTER_ID or 'local'}] 所有 namespace …")
     retry_delay = 5
     while True:
-        _watcher_heartbeat = time.monotonic()
+        # 每次（重）连接前对账，覆盖宕机/重连期间漏采的 DELETED 事件
+        _reconcile()
         try:
             w = k8s_watch.Watch()
-            log.info(f"Pod watcher 已连接，开始监听事件 …")
+            kwargs = {"timeout_seconds": 300}
+            if _last_resource_version:
+                kwargs["resource_version"] = _last_resource_version
+                log.info(f"Pod watcher 断点续传，resourceVersion={_last_resource_version} …")
+            else:
+                log.info("Pod watcher 全量连接，开始监听事件 …")
+            # 心跳仅在成功建立连接后刷新，确保连接失败时 watchdog 能触发
+            _watcher_heartbeat = time.monotonic()
             for event in w.stream(
                 _k8s_core.list_pod_for_all_namespaces,
-                timeout_seconds=300,
+                **kwargs,
             ):
                 _watcher_heartbeat = time.monotonic()
+                # 持续更新 resourceVersion，断线后可从断点续传
+                rv = event["object"].metadata.resource_version
+                if rv:
+                    _last_resource_version = rv
                 etype = event["type"]
                 pod   = event["object"]
                 ns    = pod.metadata.namespace
@@ -620,9 +633,15 @@ def _watch_loop():
             retry_delay = 5
 
         except Exception as e:
-            log.error(f"Pod watcher 异常 (将在 {retry_delay}s 后重连): {e}")
+            # resourceVersion 过期（410 Gone）：丢弃断点，下次全量重连
+            if "410" in str(e) or "Gone" in str(e) or "too old" in str(e).lower():
+                log.warning(f"Pod watcher resourceVersion 已过期，将全量重连: {e}")
+                _last_resource_version = None
+            else:
+                log.error(f"Pod watcher 异常 (将在 {retry_delay}s 后重连): {e}")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
+            # 注意：此处不刷新心跳，连接持续失败时 watchdog 将在 400s 后触发重启
 
 
 def _watcher_watchdog():
@@ -636,14 +655,13 @@ def _watcher_watchdog():
 
 
 # ──────────────────────────────────────────────────────────
-# 启动对账：清理 DB 中已消失 Pod 的僵尸 active 记录
+# 对账：清理 DB 中已消失 Pod 的僵尸 active 记录
 # ──────────────────────────────────────────────────────────
 
-def _startup_reconcile():
+def _reconcile():
     """对账 DB 与 K8s 实际状态：将 K8s 中已不存在的 active/provisioning 记录标为 expired。
 
-    调用时机：_load_uids_from_db() 之后、_initial_scan() 之前。
-    解决采集器宕机期间终止的 Pod 因漏收 DELETED 事件而永久停留在 active 的问题。
+    每次 watcher 重连前调用，覆盖所有宕机/重连场景。
     """
     if not CLUSTER_ID:
         return
@@ -662,13 +680,12 @@ def _startup_reconcile():
             )
             db_records = cur.fetchall()
     except Exception as e:
-        log.error(f"启动对账：查询 DB 失败: {e}")
+        log.error(f"[对账] 查询 DB 失败: {e}")
         _put_conn(conn, error=True)
         return
     _put_conn(conn)
 
     if not db_records:
-        log.info("启动对账：无 active/provisioning 记录，跳过")
         return
 
     # 2. 获取 K8s 当前所有 Pod UID
@@ -676,7 +693,7 @@ def _startup_reconcile():
         pods = _k8s_core.list_pod_for_all_namespaces()
         live_uids = {pod.metadata.uid for pod in pods.items}
     except Exception as e:
-        log.error(f"启动对账：获取 K8s pod 列表失败，跳过对账: {e}")
+        log.error(f"[对账] 获取 K8s pod 列表失败，跳过: {e}")
         return
 
     now = now_utc()
@@ -700,15 +717,18 @@ def _startup_reconcile():
                 except Exception:
                     pass  # pod 已被 GC 或无权读取，用兜底
 
-            # expires_at：真实终止时间，或 _updated_at + 30min 兜底
+            # expires_at：真实终止时间，或 max(_updated_at, now - watchdog窗口) 兜底。
+            # watchdog 保证进程在 _WATCHER_IDLE_MAX+120s 内必然重启，
+            # 所以 now - 该窗口 是比 _updated_at+30min 更精确的估算上界。
+            _max_downtime = timedelta(seconds=_WATCHER_IDLE_MAX + 120)
             if finished_at:
                 expires_at = finished_at
             else:
                 try:
                     updated_at = parse_iso(str(updated_at_str))
-                    expires_at = (updated_at + timedelta(minutes=30)) if updated_at else now
+                    expires_at = max(updated_at, now - _max_downtime) if updated_at else now - _max_downtime
                 except Exception:
-                    expires_at = now
+                    expires_at = now - _max_downtime
 
             # 重算 ttl_seconds / duration
             ttl_seconds = 0
@@ -730,7 +750,7 @@ def _startup_reconcile():
                 conn.commit()
                 _mark_terminal(env_id)
                 expired_count += 1
-                source = "K8s finishedAt" if finished_at else "_updated_at+30min"
+                source = "K8s finishedAt" if finished_at else "max(_updated_at, now-watchdog窗口)"
                 log.info(f"[对账] {namespace}/{name} → expired (expires_at={expires_at.isoformat()[:19]}, 来源={source})")
             except Exception as e:
                 log.warning(f"[对账] 更新 {env_id} 失败: {e}")
@@ -741,7 +761,8 @@ def _startup_reconcile():
     finally:
         _put_conn(conn)
 
-    log.info(f"启动对账完成：{expired_count}/{len(db_records)} 条记录标记为 expired")
+    if expired_count:
+        log.info(f"[对账] 完成：{expired_count}/{len(db_records)} 条记录标记为 expired")
 
 
 # ──────────────────────────────────────────────────────────
@@ -1090,7 +1111,6 @@ if __name__ == "__main__":
 
     if MODE in ("collector", "standalone"):
         _load_uids_from_db()
-        _startup_reconcile()
         _initial_scan()
         threading.Thread(target=_watch_loop, daemon=True, name="watcher").start()
         threading.Thread(target=_watcher_watchdog, daemon=True, name="watcher-watchdog").start()
