@@ -16,7 +16,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -636,6 +636,115 @@ def _watcher_watchdog():
 
 
 # ──────────────────────────────────────────────────────────
+# 启动对账：清理 DB 中已消失 Pod 的僵尸 active 记录
+# ──────────────────────────────────────────────────────────
+
+def _startup_reconcile():
+    """对账 DB 与 K8s 实际状态：将 K8s 中已不存在的 active/provisioning 记录标为 expired。
+
+    调用时机：_load_uids_from_db() 之后、_initial_scan() 之前。
+    解决采集器宕机期间终止的 Pod 因漏收 DELETED 事件而永久停留在 active 的问题。
+    """
+    if not CLUSTER_ID:
+        return
+
+    log.info(f"启动对账：检查集群 [{CLUSTER_ID}] 中僵尸 active 记录 …")
+
+    # 1. 从 DB 拉出该集群所有 active/provisioning 记录
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT env_id, name, _namespace, created_at, _updated_at "
+                "FROM pod_history "
+                "WHERE cluster = %s AND status IN ('active', 'provisioning')",
+                (CLUSTER_ID,),
+            )
+            db_records = cur.fetchall()
+    except Exception as e:
+        log.error(f"启动对账：查询 DB 失败: {e}")
+        _put_conn(conn, error=True)
+        return
+    _put_conn(conn)
+
+    if not db_records:
+        log.info("启动对账：无 active/provisioning 记录，跳过")
+        return
+
+    # 2. 获取 K8s 当前所有 Pod UID
+    try:
+        pods = _k8s_core.list_pod_for_all_namespaces()
+        live_uids = {pod.metadata.uid for pod in pods.items}
+    except Exception as e:
+        log.error(f"启动对账：获取 K8s pod 列表失败，跳过对账: {e}")
+        return
+
+    now = now_utc()
+    expired_count = 0
+    conn = _get_conn()
+    try:
+        for env_id, name, namespace, created_at_str, updated_at_str in db_records:
+            if env_id in live_uids:
+                continue  # pod 仍在运行，无需处理
+
+            # 尝试从 K8s 读取真实终止时间（pod 可能还未被 GC）
+            finished_at = None
+            if namespace and name:
+                try:
+                    pod = _k8s_core.read_namespaced_pod(name=name, namespace=namespace)
+                    for cs in (pod.status.container_statuses or []):
+                        if cs.state and cs.state.terminated and cs.state.terminated.finished_at:
+                            ft = cs.state.terminated.finished_at
+                            finished_at = ft if ft.tzinfo else ft.replace(tzinfo=timezone.utc)
+                            break
+                except Exception:
+                    pass  # pod 已被 GC 或无权读取，用兜底
+
+            # expires_at：真实终止时间，或 _updated_at + 30min 兜底
+            if finished_at:
+                expires_at = finished_at
+            else:
+                try:
+                    updated_at = parse_iso(str(updated_at_str))
+                    expires_at = (updated_at + timedelta(minutes=30)) if updated_at else now
+                except Exception:
+                    expires_at = now
+
+            # 重算 ttl_seconds / duration
+            ttl_seconds = 0
+            duration = ""
+            if created_at_str:
+                created_dt = parse_iso(str(created_at_str))
+                if created_dt:
+                    ttl_seconds = max(0, int((expires_at - created_dt).total_seconds()))
+                    duration = format_duration(ttl_seconds)
+
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE pod_history "
+                        "SET status='expired', expires_at=%s, ttl_seconds=%s, duration=%s, _updated_at=%s "
+                        "WHERE env_id=%s",
+                        (expires_at.isoformat(), ttl_seconds, duration, now.isoformat(), env_id),
+                    )
+                conn.commit()
+                _mark_terminal(env_id)
+                expired_count += 1
+                source = "K8s finishedAt" if finished_at else "_updated_at+30min"
+                log.info(f"[对账] {namespace}/{name} → expired (expires_at={expires_at.isoformat()[:19]}, 来源={source})")
+            except Exception as e:
+                log.warning(f"[对账] 更新 {env_id} 失败: {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    finally:
+        _put_conn(conn)
+
+    log.info(f"启动对账完成：{expired_count}/{len(db_records)} 条记录标记为 expired")
+
+
+# ──────────────────────────────────────────────────────────
 # 启动时全量扫描运行中 Pod（collector / standalone 模式）
 # ──────────────────────────────────────────────────────────
 
@@ -981,6 +1090,7 @@ if __name__ == "__main__":
 
     if MODE in ("collector", "standalone"):
         _load_uids_from_db()
+        _startup_reconcile()
         _initial_scan()
         threading.Thread(target=_watch_loop, daemon=True, name="watcher").start()
         threading.Thread(target=_watcher_watchdog, daemon=True, name="watcher-watchdog").start()
