@@ -182,7 +182,9 @@ _UPSERT_SQL = """
         duration = EXCLUDED.duration,
         wait_duration = EXCLUDED.wait_duration,
         groups = EXCLUDED.groups,
-        extend_env_comments = EXCLUDED.extend_env_comments,
+        extend_env_comments = CASE WHEN EXCLUDED.extend_env_comments IN ('', '{}')
+                                    THEN pod_history.extend_env_comments
+                                    ELSE EXCLUDED.extend_env_comments END,
         resource_summary = EXCLUDED.resource_summary,
         node_ip = EXCLUDED.node_ip,
         npu_list = EXCLUDED.npu_list,
@@ -843,7 +845,32 @@ def _cleanup_loop():
             log.error(f"清理历史时出错: {e}")
 
 
+def _er_to_info(er) -> dict:
+    """从 EphemeralRunner 对象提取工作流信息（仅保留非空字段）。"""
+    rs = er.get("status", {})
+    rl = er.get("metadata", {}).get("labels", {})
+    info = {
+        "workflow_ref": rs.get("jobWorkflowRef", ""),
+        "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
+        "job_display_name": rs.get("jobDisplayName", ""),
+        "job_id": rs.get("jobId", ""),
+        "job_repository": rs.get("jobRepositoryName", ""),
+        "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
+        "organization": rl.get("actions.github.com/organization", ""),
+        "repository": rl.get("actions.github.com/repository", ""),
+    }
+    return {k: v for k, v in info.items() if v}
+
+
 def _sync_ephemeral_runners():
+    """同步 EphemeralRunner 工作流信息到 pod_history（每 RUNNER_SYNC_INTERVAL 秒）。
+
+    Part A：本集群 active/provisioning 的 -workflow 记录，按 (namespace, runner_name)
+    从本地 ER 补/更新。
+    Part B（_sync_remote_workflow_pods）：Liqo 虚拟节点上的 runner pod，把本地 ER 信息
+    按 name=<runner>-workflow 推到远端集群的 -workflow 记录（cn12 等 ARC 源集群用）。
+    两者共用一次本地 ER list。
+    """
     if not _k8s_custom:
         return
     try:
@@ -860,23 +887,10 @@ def _sync_ephemeral_runners():
     for item in runners.get("items", []):
         name = item.get("metadata", {}).get("name", "")
         ns = item.get("metadata", {}).get("namespace", "")
-        if not name:
-            continue
-        rs = item.get("status", {})
-        rl = item.get("metadata", {}).get("labels", {})
-        info = {
-            "workflow_ref": rs.get("jobWorkflowRef", ""),
-            "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
-            "job_display_name": rs.get("jobDisplayName", ""),
-            "job_id": rs.get("jobId", ""),
-            "job_repository": rs.get("jobRepositoryName", ""),
-            "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
-            "organization": rl.get("actions.github.com/organization", ""),
-            "repository": rl.get("actions.github.com/repository", ""),
-        }
-        info = {k: v for k, v in info.items() if v}
-        runner_map[(ns, name)] = info
+        if name:
+            runner_map[(ns, name)] = _er_to_info(item)
 
+    # ── Part A：本集群 active/provisioning -workflow 记录 ──
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
@@ -919,6 +933,84 @@ def _sync_ephemeral_runners():
         raise
     else:
         _put_conn(conn)
+
+    # ── Part B：跨集群 —— 虚拟节点上的 runner pod → 远端 -workflow 记录 ──
+    _sync_remote_workflow_pods(runner_map)
+
+
+def _sync_remote_workflow_pods(runner_map: dict):
+    """Part B：对调度到 Liqo 虚拟节点且 Running 的 runner pod，把 runner_map 中的
+    工作流信息写入远端 -workflow job pod 记录（name = <runner>-workflow）。
+
+    runner pod（不带 -workflow 后缀，名 == EphemeralRunner 名）经 Liqo 虚拟节点 offload
+    到远端集群后，-workflow job pod 落在远端（其记录由远端 collector 写入，但远端本地
+    查不到 ER）。本集群（ARC 源，如 cn12）持有 ER 本地副本，按 name 配对直接 UPDATE
+    共享 DB，远端 collector 无需跨集群查询。
+
+    按本 runner 创建时间限定记录范围（created_at >= runner创建-1h，或 Pending 空值），
+    避免 runner 名复用撞旧终态记录。仅本地存在虚拟节点时执行（否则立即返回）。
+    """
+    try:
+        nodes = _k8s_core.list_node(
+            label_selector="liqo.io/type=virtual-node").items
+    except Exception as e:
+        log.error(f"[跨集群] 列节点失败: {e}")
+        return
+    vnode_set = {n.metadata.name for n in nodes}
+    if not vnode_set:
+        return
+
+    candidates = []  # (ns, runner_name, runner_creation)
+    for vn in vnode_set:
+        try:
+            pods = _k8s_core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={vn}").items
+        except Exception as e:
+            log.error(f"[跨集群] 列 {vn} 上 pod 失败: {e}")
+            continue
+        for p in pods:
+            if p.metadata.namespace in SKIP_NS:
+                continue
+            if (p.status.phase if p.status else "") != "Running":
+                continue
+            name = p.metadata.name
+            if name.endswith("-workflow"):
+                continue  # -workflow 是 job pod，runner pod 不带此后缀
+            candidates.append((p.metadata.namespace, name, p.metadata.creation_timestamp))
+    if not candidates:
+        return
+
+    info_list = []  # (info_json, wf_name, lower_bound, info_json) 末位用于 IS DISTINCT FROM
+    for ns, runner_name, runner_creation in candidates:
+        info = runner_map.get((ns, runner_name))
+        if not info:
+            continue
+        lower = ""
+        if runner_creation:
+            lower = (runner_creation - timedelta(hours=1)).isoformat()
+        info_json = json.dumps(info, ensure_ascii=False)
+        info_list.append((info_json, runner_name + "-workflow", lower, info_json))
+
+    if not info_list:
+        return
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE pod_history SET extend_env_comments = %s "
+                "WHERE name = %s "
+                "AND (created_at = '' OR created_at >= %s) "
+                "AND COALESCE(extend_env_comments, '{}') IS DISTINCT FROM %s",
+                info_list,
+            )
+        conn.commit()
+        log.info(f"[跨集群] cn12 为 {len(info_list)} 个远端 -workflow pod 补写工作流信息")
+    except Exception as e:
+        log.warning(f"[跨集群] 补写失败: {e}")
+        _put_conn(conn, error=True)
+        return
+    _put_conn(conn)
 
 
 def _runner_sync_loop():
