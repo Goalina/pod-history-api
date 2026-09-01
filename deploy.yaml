@@ -147,11 +147,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
           readinessProbe:
             httpGet:
               path: /api/v1/health
@@ -207,11 +207,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
 
 ---
 # ── Collector: gy003 (远程集群，Vault 注入 kubeconfig) ─────
@@ -269,11 +269,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
@@ -339,11 +339,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
@@ -409,11 +409,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
@@ -479,11 +479,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
@@ -549,11 +549,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
@@ -619,11 +619,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
@@ -689,11 +689,11 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
           resources:
             requests:
-              cpu: "100m"
-              memory: "256Mi"
-            limits:
               cpu: "500m"
               memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
       volumes:
         - name: token-vol
           projected:
