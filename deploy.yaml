@@ -427,17 +427,17 @@ spec:
                   path: token
 
 ---
-# ── Collector: gy001 (远程集群，Vault 注入 kubeconfig) ─────
+# ── Collector: gy-001 (远程集群，Vault 注入 kubeconfig) ─────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pod-history-collector-gy001
+  name: pod-history-collector-gy-001
   namespace: arc-history
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pod-history-collector-gy001
+      app: pod-history-collector-gy-001
   strategy:
     rollingUpdate:
       maxSurge: 1
@@ -458,7 +458,7 @@ spec:
         vault.hashicorp.com/role: pod-history-api
         vault.hashicorp.com/tls-skip-verify: "true"
       labels:
-        app: pod-history-collector-gy001
+        app: pod-history-collector-gy-001
     spec:
       serviceAccountName: pod-history-api
       imagePullSecrets:
@@ -473,7 +473,7 @@ spec:
             - name: MODE
               value: "collector"
             - name: CLUSTER_ID
-              value: "gy001"
+              value: "gy-001"
             - name: KUBECONFIG_PATH
               value: "/vault/secrets/gy001.yaml"
             - name: RETENTION_DAYS
