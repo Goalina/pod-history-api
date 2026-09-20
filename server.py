@@ -151,6 +151,7 @@ _CREATE_TABLE_SQL = """
         resource_summary TEXT DEFAULT '{}',
         node_ip TEXT DEFAULT '',
         npu_list TEXT DEFAULT '[]',
+        source TEXT DEFAULT 'unknown',
         _namespace TEXT DEFAULT '',
         _node TEXT DEFAULT '',
         _image TEXT DEFAULT '',
@@ -164,14 +165,20 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_created_at ON pod_history(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_cluster ON pod_history(cluster)",
     "CREATE INDEX IF NOT EXISTS idx_name ON pod_history(name)",
+    "CREATE INDEX IF NOT EXISTS idx_source ON pod_history(source)",
+]
+
+_MIGRATE_SQL = [
+    # 加列必须在 _CREATE_INDEXES_SQL 之前执行（见 _init_db）；idx_source 由建索引统一负责
+    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'",
 ]
 
 _UPSERT_SQL = """
     INSERT INTO pod_history
         (env_id, name, cluster, status, created_at, expires_at, ttl_seconds, duration,
          wait_duration, groups, extend_env_comments, resource_summary,
-         node_ip, npu_list, _namespace, _node, _image, _exit_code, _updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         node_ip, npu_list, source, _namespace, _node, _image, _exit_code, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (env_id) DO UPDATE SET
         name = EXCLUDED.name,
         cluster = EXCLUDED.cluster,
@@ -188,6 +195,7 @@ _UPSERT_SQL = """
         resource_summary = EXCLUDED.resource_summary,
         node_ip = EXCLUDED.node_ip,
         npu_list = EXCLUDED.npu_list,
+        source = EXCLUDED.source,
         _namespace = EXCLUDED._namespace,
         _node = EXCLUDED._node,
         _image = EXCLUDED._image,
@@ -218,6 +226,10 @@ def _init_db():
     try:
         with conn.cursor() as cur:
             cur.execute(_CREATE_TABLE_SQL)
+            # 迁移必须在建索引之前：存量表 CREATE TABLE IF NOT EXISTS 会跳过，
+            # source 列尚未存在，若先建 idx_source 会因 column 不存在而崩溃。
+            for sql in _MIGRATE_SQL:
+                cur.execute(sql)
             for idx_sql in _CREATE_INDEXES_SQL:
                 cur.execute(idx_sql)
         conn.commit()
@@ -332,6 +344,7 @@ def _flush_buffer():
                     json.dumps(r.get("resource_summary", {}), ensure_ascii=False),
                     r.get("node_ip", ""),
                     json.dumps(r.get("npu_list", []), ensure_ascii=False),
+                    r.get("source", "unknown"),
                     r.get("_namespace", ""),
                     r.get("_node", ""),
                     r.get("_image", ""),
@@ -376,6 +389,18 @@ def _get_exit_code(status) -> int | None:
 
 
 _NPU_RE = re.compile(r'ascend|npu|gpu', re.IGNORECASE)
+
+_OCTOPUS_ANNOTATION_MAP = {
+    "octopus.io/pc-repository":       "repository",
+    "octopus.io/pc-repository-owner": "organization",
+    "octopus.io/pc-repository-url":   "repository_url",
+    "octopus.io/pc-workflow-ref":     "workflow_ref",
+    "octopus.io/pc-pipeline-id":      "pipeline_id",
+    "octopus.io/pc-pipeline-run-id":  "pipeline_run_id",
+    "octopus.io/job-name":            "job_display_name",
+    "octopus.io/job-external-id":     "job_external_id",
+    "octopus.io/project-id":          "project_id",
+}
 
 
 def _parse_npu(reqs):
@@ -469,36 +494,55 @@ def _extract_record(pod) -> dict | None:
     resource_summary = {"total_devices": len(devices), "devices": devices} if devices else {}
     groups = {meta.namespace: {"device_count": len(devices)}}
 
-    extend_env_comments = {}
-    if meta.name.endswith("-workflow") and _k8s_custom:
-        runner_name = meta.name[: -len("-workflow")]
-        try:
-            runner = _k8s_custom.get_namespaced_custom_object(
-                group="actions.github.com",
-                version="v1alpha1",
-                namespace=meta.namespace,
-                plural="ephemeralrunners",
-                name=runner_name,
-            )
-            rs = runner.get("status", {})
-            rl = runner.get("metadata", {}).get("labels", {})
-            extend_env_comments = {
-                "workflow_ref": rs.get("jobWorkflowRef", ""),
-                "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
-                "job_display_name": rs.get("jobDisplayName", ""),
-                "job_id": rs.get("jobId", ""),
-                "job_repository": rs.get("jobRepositoryName", ""),
-                "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
-                "organization": rl.get("actions.github.com/organization", ""),
-                "repository": rl.get("actions.github.com/repository", ""),
-            }
-            extend_env_comments = {k: v for k, v in extend_env_comments.items() if v}
-            if extend_env_comments:
-                log.info(f"  EphemeralRunner {runner_name}: job={extend_env_comments.get('job_display_name', '')}")
-        except Exception as e:
-            log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
-
     annotations = meta.annotations or {}
+    labels = meta.labels or {}
+
+    # 判断 source，按可靠的 label/annotation，不依赖名字
+    if annotations.get("octopus.io/job-run-id"):
+        source = "atomgit-action"
+    elif labels.get("actions-ephemeral-runner") == "True" or labels.get("runner-pod"):
+        source = "github-action"
+    else:
+        source = "unknown"
+
+    # Octopus/AtomGit CI pod 直接从 annotation 读 extend_env_comments
+    # ARC workflow pod 由 _sync_ephemeral_runners 异步填充，_extract_record 时先置空
+    if source == "atomgit-action":
+        extend_env_comments = {
+            v: annotations[k]
+            for k, v in _OCTOPUS_ANNOTATION_MAP.items()
+            if annotations.get(k)
+        }
+        log.info(f"  AtomGit CI pod {meta.name}: job={extend_env_comments.get('job_display_name', '')}")
+    else:
+        extend_env_comments = {}
+        if meta.name.endswith("-workflow") and _k8s_custom:
+            runner_name = meta.name[: -len("-workflow")]
+            try:
+                runner = _k8s_custom.get_namespaced_custom_object(
+                    group="actions.github.com",
+                    version="v1alpha1",
+                    namespace=meta.namespace,
+                    plural="ephemeralrunners",
+                    name=runner_name,
+                )
+                rs = runner.get("status", {})
+                rl = runner.get("metadata", {}).get("labels", {})
+                extend_env_comments = {
+                    "workflow_ref": rs.get("jobWorkflowRef", ""),
+                    "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
+                    "job_display_name": rs.get("jobDisplayName", ""),
+                    "job_id": rs.get("jobId", ""),
+                    "job_repository": rs.get("jobRepositoryName", ""),
+                    "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
+                    "organization": rl.get("actions.github.com/organization", ""),
+                    "repository": rl.get("actions.github.com/repository", ""),
+                }
+                extend_env_comments = {k: v for k, v in extend_env_comments.items() if v}
+                if extend_env_comments:
+                    log.info(f"  EphemeralRunner {runner_name}: job={extend_env_comments.get('job_display_name', '')}")
+            except Exception as e:
+                log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
 
     return {
         "env_id":              meta.uid,
@@ -515,6 +559,7 @@ def _extract_record(pod) -> dict | None:
         "resource_summary":    resource_summary,
         "node_ip":             (status.host_ip or "") if status else "",
         "npu_list":            _parse_npu_list(annotations),
+        "source":              source,
         "_namespace":          meta.namespace,
         "_node":               (spec.node_name or ""),
         "_image":              (spec.containers[0].image if spec.containers else ""),
@@ -1026,9 +1071,11 @@ def _runner_sync_loop():
 # 3.8.1 查询逻辑（SQL）
 # ──────────────────────────────────────────────────────────
 
-def _build_query(start_time: datetime, end_time: datetime,
+def _build_where(start_time: datetime, end_time: datetime,
                  status=None, match_mode: str = "created",
-                 name_prefix: str = None, cluster_filter: str = None) -> tuple[str, list]:
+                 name_prefix: str = None, cluster_filter: str = None,
+                 source_filter: str = None) -> tuple[str, list]:
+    """只构造 WHERE 子句和参数，SELECT/ORDER/LIMIT 由调用方拼接。"""
     conditions = []
     params = []
 
@@ -1069,9 +1116,12 @@ def _build_query(start_time: datetime, end_time: datetime,
         conditions.append("cluster = %s")
         params.append(cluster_filter)
 
+    if source_filter:
+        conditions.append("source = %s")
+        params.append(source_filter)
+
     where = " AND ".join(conditions)
-    sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
-    return sql, params
+    return where, params
 
 
 _JSON_FIELDS = ("groups", "extend_env_comments", "resource_summary", "npu_list")
@@ -1103,7 +1153,15 @@ def query_history(start_time: datetime, end_time: datetime,
                   status=None,
                   match_mode: str = "created",
                   name_prefix: str = None,
-                  cluster_filter: str = None) -> list:
+                  cluster_filter: str = None,
+                  source_filter: str = None,
+                  limit: int = None,
+                  offset: int = 0):
+    """查询历史记录。
+
+    - 不分页（limit is None）：返回 list[dict]，兼容主路由原有行为。
+    - 分页（limit 给定）：返回 (list[dict], total)，total 为满足条件的总条数。
+    """
     if MODE in ("collector", "standalone"):
         try:
             _flush_buffer()
@@ -1112,14 +1170,27 @@ def query_history(start_time: datetime, end_time: datetime,
             # connection; the HTTP client would get no response at all.
             log.warning(f"query_history 前 flush 失败（忽略）: {_flush_err}")
 
-    sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter)
+    where, params = _build_where(start_time, end_time, status, match_mode,
+                                 name_prefix, cluster_filter, source_filter)
+
+    paginated = limit is not None
+    data_sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
+    data_params = list(params)
+    if paginated:
+        data_sql += " LIMIT %s OFFSET %s"
+        data_params.extend([limit, offset])
 
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(data_sql, data_params)
             rows = cur.fetchall()
             col_names = [d[0] for d in cur.description]
+            total = None
+            if paginated:
+                # 分页时额外查总数（走 source/created_at 索引，开销远小于取全量行）
+                cur.execute(f"SELECT COUNT(*) FROM pod_history WHERE {where}", params)
+                total = cur.fetchone()[0]
         conn.commit()
     except Exception:
         _put_conn(conn, error=True)
@@ -1127,7 +1198,10 @@ def query_history(start_time: datetime, end_time: datetime,
     else:
         _put_conn(conn)
 
-    return _rows_to_records(rows, col_names)
+    records = _rows_to_records(rows, col_names)
+    if paginated:
+        return records, total
+    return records
 
 
 # ──────────────────────────────────────────────────────────
@@ -1165,7 +1239,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/health":
             return self._ok({"status": "ok", "service": "pod-history-api", "mode": MODE})
 
-        if path == "/api/v1/envs/history":
+        if path in ("/api/v1/envs/history", "/api/v1/envs/history/atomgit"):
             st_str = params.get("start_time", [None])[0]
             et_str = params.get("end_time",   [None])[0]
             if not st_str or not et_str:
@@ -1186,17 +1260,58 @@ class Handler(BaseHTTPRequestHandler):
             if match_mode not in ("created", "released", "overlap"):
                 return self._err("match_mode 取值: created / released / overlap")
 
-            envs = query_history(
+            is_atomgit = path.endswith("/atomgit")
+            # /atomgit 路由固定只返回 atomgit-action 来源的记录
+            source_filter = "atomgit-action" if is_atomgit else None
+
+            # 仅 /atomgit 路由支持分页；主路由保持原有全量返回行为不变
+            limit = offset = None
+            if is_atomgit:
+                limit, offset = 1000, 0
+                if params.get("limit"):
+                    try:
+                        limit = int(params["limit"][0])
+                    except ValueError:
+                        return self._err("limit 必须为整数")
+                    if limit < 1 or limit > 5000:
+                        return self._err("limit 取值范围: 1 ~ 5000")
+                if params.get("offset"):
+                    try:
+                        offset = int(params["offset"][0])
+                    except ValueError:
+                        return self._err("offset 必须为整数")
+                    if offset < 0:
+                        return self._err("offset 不能为负数")
+
+            result = query_history(
                 start_time=start_time,
                 end_time=end_time,
                 status=status_filter,
                 match_mode=match_mode,
                 name_prefix=name_prefix,
                 cluster_filter=cluster_filter,
+                source_filter=source_filter,
+                limit=limit,
+                offset=offset,
             )
+
+            if is_atomgit:
+                envs, total = result
+                clean_envs = [
+                    {k: v for k, v in e.items() if not k.startswith("_")}
+                    for e in envs
+                ]
+                return self._ok({
+                    "count": len(clean_envs),
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "envs": clean_envs,
+                })
+
             clean_envs = [
                 {k: v for k, v in e.items() if not k.startswith("_")}
-                for e in envs
+                for e in result
             ]
             return self._ok({"count": len(clean_envs), "envs": clean_envs})
 

@@ -7,7 +7,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
-- 新增 cn12 侧跨集群补写（`_sync_remote_workflow_pods`，Part B）：Liqo 多集群场景下 runner pod 经虚拟节点 offload 到远端集群后，`-workflow` job pod 落在远端但其 `EphemeralRunner` CR 留在 ARC 源集群（cn12）。cn12 通过 `liqo.io/type=virtual-node` 标签识别虚拟节点、`spec.nodeName` 定位其上的 Running runner pod，本地读 ER 后按 `name=<runner>-workflow` 把工作流信息 UPDATE 到共享 DB 的远端记录；远端 collector 无需任何跨集群查询
+- 新增 `source` 字段（`github-action` / `atomgit-action` / `unknown`），在写入时由 `_extract_record` 按 label/annotation 判断填充：
+  - `github-action`：Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod）
+  - `atomgit-action`：Pod 带 `octopus.io/job-run-id` annotation（AtomGit/GitCode CI 拉起）
+  - `unknown`：来源无法识别的 Pod
+- 新增 AtomGit CI pod 的 `extend_env_comments` 提取：直接从 `octopus.io/` 前缀 annotation 读取 9 个字段（`repository`、`organization`、`repository_url`、`workflow_ref`、`pipeline_id`、`pipeline_run_id`、`job_display_name`、`job_external_id`、`project_id`），无需额外 K8s API 调用
+- 新增路由 `GET /api/v1/envs/history/atomgit`：固定只返回 `source=atomgit-action` 的记录，参数与原路由完全一致，不影响原有接口行为
+- `/atomgit` 路由支持分页：`limit`（默认 1000，范围 1~5000）+ `offset`（默认 0），响应新增 `total`（满足条件的总条数）、`limit`、`offset` 字段。主路由不分页，行为保持不变
+
+### Changed
+- `source` 列已加入 DB schema（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），存量记录默认值为 `unknown`，服务启动时自动迁移，无需手动执行 SQL
+- ARC source 判断从依赖 Pod 名字后缀改为依赖可靠的 label（`actions-ephemeral-runner`、`runner-pod`）
+- `_build_query` 拆分为 `_build_where`（只出 WHERE 子句），SELECT/ORDER/LIMIT 由 `query_history` 拼接，以支持分页与 COUNT 复用同一套过滤条件
+
+### Fixed
+- `_init_db` 迁移顺序：`ALTER TABLE ADD COLUMN source` 必须在 `CREATE INDEX idx_source` 之前执行。原顺序在存量表（`CREATE TABLE IF NOT EXISTS` 跳过）上会因 `source` 列不存在导致建索引崩溃、服务无法启动
+- `_MIGRATE_SQL` 中 `source` 默认值 `'plain'` 更正为 `'unknown'`，与建表 SQL 一致；去掉其中重复的 `idx_source` 建索引（统一由 `_CREATE_INDEXES_SQL` 负责）
+
+---
+
+## [2026-09-16]
+
+### Added
+- 新增 wlcb-001 集群 collector（Vault key ascendwlcb001）
+
+---
+
+## [2026-09-09]
+
+### Added
+- 新增 gy-001 集群 collector（Vault key ascendGY001）
+
+### Fixed
+- collector 命名统一 gy001 → gy-001
+
+---
+
+## [2026-09-01]
+
+### Added
+- cn12 侧跨集群补写（`_sync_remote_workflow_pods`，Part B）：Liqo 多集群场景下 runner pod 经虚拟节点 offload 到远端集群后，`-workflow` job pod 落在远端但其 `EphemeralRunner` CR 留在 ARC 源集群（cn12）。cn12 通过 `liqo.io/type=virtual-node` 标签识别虚拟节点、`spec.nodeName` 定位其上的 Running runner pod，本地读 ER 后按 `name=<runner>-workflow` 把工作流信息 UPDATE 到共享 DB 的远端记录；远端 collector 无需任何跨集群查询
 
 ### Changed
 - `_sync_ephemeral_runners` 合并为单函数两段（Part A 本集群 active/provisioning 记录刷新 + Part B 跨集群推送），共用一次本地 ER list，消除重复列举
@@ -15,11 +54,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 - 抽出 `_er_to_info()` 统一 ER→工作流信息提取逻辑
 
 ### Fixed
-- upsert 的 `extend_env_comments` 加 `CASE WHEN 新值空 THEN 保留旧值`：远端 collector 重跑 `_extract_record`（跨集群 pod 本地查不到 ER、产出 `{}`）时不再冲掉 cn12 已推送的工作流信息；同时修了既存问题——本地 `-workflow` pod 进终态时若 ER 已删，原逻辑会把已 enrich 的值冲回 `{}`
-- `_sync_remote_workflow_pods` 按 `created_at >= runner 创建时间-1h`（或 Pending 空值）限定记录范围，避免 runner 名复用撞旧终态记录（实测 0 误排除）
-- `_watch_loop` 断线后改为指数退避重连（5→10→20→40→60s），stream 正常超时后立即重连
-- 新增 `_watcher_watchdog` 线程：心跳超过 400s 无活动则 `os._exit(1)`，由 K8s 自动重启 pod，防止 watcher 静默卡死导致长时间漏采
-- 新增 `_reconcile()`：仅在 `_last_resource_version` 为空时执行对账（进程重启、410 Gone 后），有断点时 K8s 通过 resourceVersion 回放所有漏采事件，无需额外对账，避免每 300s 多一次全量 LIST 压力
-- 修复心跳刷新时机：`_watcher_heartbeat` 仅在成功建立 stream 连接后更新，确保连接持续失败时 watchdog 能在 400s 内触发重启（原逻辑在每次循环开始即刷新，导致 watchdog 永远不触发）
-- 实现 resourceVersion 断点续传：watcher 记录最后处理的 `resourceVersion`，重连时从断点回放错过的事件（含宕机期间的 DELETED 事件），宕机 < 1h 时可获取 pod 精确终止时间；410 Gone 时自动回退到全量重连
-- 优化 `_reconcile()` 性能：复用 `list_pod_for_all_namespaces()` 结果读取 finishedAt（消除每个僵尸记录一次额外 `read_namespaced_pod()` API 调用），并将所有 DB 更新合并为单次 `executemany` + 一次 `commit`（消除每条记录单独提交的开销）；同时修正 `live_uids` 仅含 Running/Pending 状态的 Pod，使 Succeeded/Failed 状态的 Pod 也能被正确对账
+- upsert 的 `extend_env_comments` 加 `CASE WHEN 新值空 THEN 保留旧值`：远端 collector 重跑 `_extract_record` 时不再冲掉 cn12 已推送的工作流信息；同时修了本地 `-workflow` pod 进终态时若 ER 已删会把已 enrich 的值冲回 `{}` 的问题
+- `_sync_remote_workflow_pods` 按 `created_at >= runner 创建时间-1h` 限定记录范围，避免 runner 名复用撞旧终态记录
+
+---
+
+## [2026-08-31]
+
+### Added
+- 启动对账 `_reconcile()`：collector 启动或 watcher 410 Gone 后，对账 DB 中 active/provisioning 记录与 K8s 实际状态，把已消失的 pod 标为 expired
+- `_watcher_watchdog` 线程：心跳超过 400s 无活动则 `os._exit(1)`，由 K8s 自动重启，防止 watcher 静默卡死
+
+### Changed
+- `_reconcile()` 仅在 `_last_resource_version` 为空时执行（进程重启、410 Gone 后），有断点时 K8s 回放保证事件完整性，无需额外对账
+- `_reconcile()` 复用 `list_pod_for_all_namespaces()` 结果读取 finishedAt，消除 N 次额外 API 调用，所有 DB 更新合并为单次 `executemany`
+
+### Fixed
+- resourceVersion 断点续传：watcher 重连时携带断点，K8s 回放宕机期间漏采事件；410 Gone 自动回退全量重连
+- 心跳刷新时机：`_watcher_heartbeat` 仅在 stream 成功建立后更新，确保连接持续失败时 watchdog 能触发
+- watcher 断线后指数退避重连（5→10→20→40→60s），stream 正常超时后立即重连
+
+---
+
+## [2026-08-29]
+
+### Fixed
+- Bug 1：`_flush_buffer` 数据丢失——`clear()` 移到 commit 成功后执行
+- Bug 2：watch loop DB 异常导致整个 watcher 重启——内层 except 改为 log.warning，不再 raise
+- Bug 3：watcher 重连后 terminal pod 被重写为 active——else 分支加 `_is_terminal` 守卫
+- Bug 4：`_sync_ephemeral_runners` 长时间持有连接——改为先收集再 executemany 一次性提交
+- Bug 5：`query_history` flush 异常穿透为 TCP reset——`_flush_buffer()` 加 try/except
+- Bug 6：`_rows_to_records` falsy 判断跳过空字符串——改为 `is not None`
+- Pending pod 被错误计入 NPU 占用统计：`created_at` 不再 fallback 到 `creation_ts`，overlap 查询加 `created_at != ''` 条件
+- 服务重启后 provisioning pod 无法更新 `created_at`：`_load_uids_from_db` 只把 active 加入 `_running_uids`
+- expired pod 的 `ttl_seconds`/`duration` 始终为 0
+
+---
+
+## [2026-08-17]
+
+### Added
+- 迁移存储至 PostgreSQL，解决多 collector 并发写导致的 SQLite 索引损坏问题
+- 新增 `node_ip` 字段（`status.hostIP`）
+- 新增 `npu_list` 字段（解析 `huawei.com/AscendReal` 注解）
+
+### Fixed
+- PostgreSQL 连接池连接状态管理：写操作异常时 rollback 再归还，SELECT 完成后显式 commit
+- psycopg2 LIKE 子句中 `%` 未转义导致 EphemeralRunner 同步持续报错
+
+---
+
+## [2026-08-03]
+
+### Added
+- 从 EphemeralRunner CRD 获取 workflow 信息写入 `extend_env_comments`
+- `runner-sync` 线程：每 30s 批量同步 EphemeralRunner 信息到运行中 `-workflow` pod 记录
+- 多集群 collector/api 架构：collector 写独立存储，api 模式聚合查询
+
+### Changed
+- 存储从 ConfigMap 迁移到 SQLite（WAL 模式 + 索引）
+- 内存缓冲 + 定时刷盘（5s），查询下推 SQL WHERE，不再全量加载内存过滤
+
+### Fixed
+- 运行中 Pod 状态变更时更新数据库（Pending→Active）
+- SQLite journal_mode WAL → DELETE，兼容 NFS/SFS Turbo 文件锁
+
+---
+
+## [2026-07-13]
+
+### Added
+- 初始版本：Watch K8s Pod 生命周期事件，记录历史到 ConfigMap
+- `GET /api/v1/envs/history`，符合 resource-deploy-core 3.8.1 规范
+- 支持 `match_mode`（created/released/overlap）、`status`、`name_prefix` 过滤
+- 30 天 retention，每日自动清理
