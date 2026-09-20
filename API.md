@@ -1,5 +1,16 @@
 # API 接口文档
 
+## 路由总览
+
+| 路由 | 说明 |
+|---|---|
+| `GET /api/v1/envs/history` | 查询全部来源的 Pod 历史记录（行为与历史版本一致） |
+| `GET /api/v1/envs/history/atomgit` | 仅查询 AtomGit CI（`source=atomgit-action`）拉起的 Pod，参数与主路由完全一致 |
+
+两个路由共享同一套查询逻辑与参数，唯一区别是 `/atomgit` 固定按 `source=atomgit-action` 过滤。
+
+---
+
 ## `GET /api/v1/envs/history`
 
 查询 Pod 历史记录，符合 resource-deploy-core 3.8.1 规范。
@@ -213,9 +224,12 @@
 #### `envs[].extend_env_comments`
 
 - **类型：** object
-- **说明：** 扩展元信息。当前用于关联 **GitHub Actions** 工作流数据
-- **触发条件：** 仅 Pod 名称以 `-workflow` 结尾时自动填充，其余 Pod 为空对象 `{}`
-- **子字段：**
+- **说明：** 扩展元信息，用于关联 CI 工作流数据。字段结构取决于 `source`
+- **触发条件：**
+  - `source=github-action`：Pod 名称以 `-workflow` 结尾时，由采集器查询 EphemeralRunner CRD 异步填充
+  - `source=atomgit-action`：采集时直接从 `octopus.io/` 前缀 annotation 提取
+  - 其余情况为空对象 `{}`
+- **子字段（`source=github-action`）：**
 
 | 字段 | 类型 | 示例 | 说明 |
 |---|---|---|---|
@@ -227,6 +241,20 @@
 | `runner_id` | string | `99` | GitHub Runner ID |
 | `organization` | string | `my-org` | 所属 GitHub 组织 |
 | `repository` | string | `my-org/my-repo` | 所属 GitHub 仓库（含组织前缀） |
+
+- **子字段（`source=atomgit-action`）：** 取自 Pod 的 `octopus.io/` 前缀 annotation，共 9 个字段
+
+| 字段 | 类型 | 示例 | 来源 annotation |
+|---|---|---|---|
+| `repository` | string | `Ascend/MindSpeed-MM` | `octopus.io/pc-repository` |
+| `organization` | string | `Ascend` | `octopus.io/pc-repository-owner` |
+| `repository_url` | string | `https://gitcode.com/Ascend/MindSpeed-MM.git` | `octopus.io/pc-repository-url` |
+| `workflow_ref` | string | `Ascend/MindSpeed-MM/.gitcode/workflows/ci.yml@refs/heads/master` | `octopus.io/pc-workflow-ref` |
+| `pipeline_id` | string | `eb80ae42a2fe4d4faa299a7b6f890443` | `octopus.io/pc-pipeline-id` |
+| `pipeline_run_id` | string | `0b5e335e0fca46a6ba3a5691941a0283` | `octopus.io/pc-pipeline-run-id` |
+| `job_display_name` | string | `UT-pool` | `octopus.io/job-name` |
+| `job_external_id` | string | `478fde37728142028a315aadb30fc4a5` | `octopus.io/job-external-id` |
+| `project_id` | string | `bf93426ae91d46a5b21f59aa60d83c3e` | `octopus.io/project-id` |
 
 > 仅非空字段会出现，不同 Pod 返回的字段子集可能不同。
 
@@ -313,6 +341,22 @@ function buildGithubUrls(comments) {
 - **说明：** Pod 使用的 NPU 物理卡号列表，从 Pod 注解 `huawei.com/AscendReal` 解析
 - **解析规则：** 注解值如 `"Ascend910-0 Ascend910-1"` → 提取末尾数字 → `["0", "1"]`
 - **条件：** 仅华为云昇腾环境且 Pod 带有该注解时有值，否则为空数组
+
+---
+
+#### `envs[].source`
+
+- **类型：** string
+- **取值：** `github-action` | `atomgit-action` | `unknown`
+- **说明：** Pod 的来源类型，采集时按 label/annotation 判断，不依赖 Pod 名字
+
+| 值 | 判断依据 | 含义 |
+|---|---|---|
+| `github-action` | Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod） | GitHub Actions ARC 拉起 |
+| `atomgit-action` | Pod 带 `octopus.io/job-run-id` annotation | AtomGit CI 拉起 |
+| `unknown` | 以上均不匹配 | 来源无法识别 |
+
+> `atomgit-action` 类型的 Pod，其 `extend_env_comments` 直接从 `octopus.io/` 前缀 annotation 提取（见下方 `extend_env_comments` 的 AtomGit 字段）。
 
 ---
 

@@ -392,14 +392,11 @@ _OCTOPUS_ANNOTATION_MAP = {
     "octopus.io/pc-repository":       "repository",
     "octopus.io/pc-repository-owner": "organization",
     "octopus.io/pc-repository-url":   "repository_url",
-    "octopus.io/pc-ref-name":         "ref_name",
     "octopus.io/pc-workflow-ref":     "workflow_ref",
     "octopus.io/pc-pipeline-id":      "pipeline_id",
     "octopus.io/pc-pipeline-run-id":  "pipeline_run_id",
     "octopus.io/job-name":            "job_display_name",
-    "octopus.io/job-run-id":          "job_run_id",
     "octopus.io/job-external-id":     "job_external_id",
-    "octopus.io/runner-set-name":     "runner_set_name",
     "octopus.io/project-id":          "project_id",
 }
 
