@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
   - `atomgit-action`：Pod 带 `octopus.io/job-run-id` annotation（AtomGit/GitCode CI 拉起）
   - `unknown`：来源无法识别的 Pod
 - 新增 AtomGit CI pod 的 `extend_env_comments` 提取：直接从 `octopus.io/` 前缀 annotation 读取，包含 `repository`、`organization`、`repository_url`、`ref_name`、`workflow_ref`、`pipeline_id`、`pipeline_run_id`、`job_display_name`、`job_run_id`、`job_external_id`、`runner_set_name`、`project_id`，无需额外 K8s API 调用
-- `GET /api/v1/envs/history` 新增可选查询参数 `source=github-action|atomgit-action|unknown`，支持按来源过滤，有索引支撑
+- 新增路由 `GET /api/v1/envs/history/atomgit`：固定只返回 `source=atomgit-action` 的记录，参数与原路由完全一致，不影响原有接口行为
 
 ### Changed
 - `source` 列已加入 DB schema（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），存量记录默认值为 `unknown`，服务启动时自动迁移，无需手动执行 SQL

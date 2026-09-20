@@ -1217,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/health":
             return self._ok({"status": "ok", "service": "pod-history-api", "mode": MODE})
 
-        if path == "/api/v1/envs/history":
+        if path in ("/api/v1/envs/history", "/api/v1/envs/history/atomgit"):
             st_str = params.get("start_time", [None])[0]
             et_str = params.get("end_time",   [None])[0]
             if not st_str or not et_str:
@@ -1234,13 +1234,12 @@ class Handler(BaseHTTPRequestHandler):
             match_mode     = params.get("match_mode",  ["created"])[0]
             name_prefix    = params.get("name_prefix", [None])[0]
             cluster_filter = params.get("cluster",     [None])[0]
-            source_filter  = params.get("source",      [None])[0]
 
             if match_mode not in ("created", "released", "overlap"):
                 return self._err("match_mode 取值: created / released / overlap")
 
-            if source_filter and source_filter not in ("github-action", "atomgit-action", "unknown"):
-                return self._err("source 取值: github-action / atomgit-action / unknown")
+            # /atomgit 路由固定只返回 atomgit-action 来源的记录
+            source_filter = "atomgit-action" if path.endswith("/atomgit") else None
 
             envs = query_history(
                 start_time=start_time,
