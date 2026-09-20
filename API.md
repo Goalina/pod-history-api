@@ -2,15 +2,28 @@
 
 ## 路由总览
 
-| 路由 | 说明 |
-|---|---|
-| `GET /api/v1/envs/history` | 查询全部来源的 Pod 历史记录（行为与历史版本一致） |
-| `GET /api/v1/envs/history/atomgit` | 仅查询 AtomGit CI（`source=atomgit-action`）拉起的 Pod，参数与主路由完全一致 |
+系统提供两个查询路由，返回的**单条记录结构完全一致**（见下方「响应字段说明」），区别只在于「查哪些 Pod」和「是否分页」。
 
-两个路由共享同一套查询逻辑与参数，区别有二：
+| 路由 | 查询范围 | 分页 | 适用场景 |
+|---|---|---|---|
+| `GET /api/v1/envs/history` | **全部来源**的 Pod（`github-action` / `atomgit-action` / `unknown`） | ❌ 一次性全量返回 | 跨来源统计、NPU 占用汇总、兼容历史调用方 |
+| `GET /api/v1/envs/history/atomgit` | **仅 AtomGit CI**（`source=atomgit-action`）拉起的 Pod | ✅ `limit`/`offset` 分页 | 只关心 AtomGit CI 任务、数据量大需翻页 |
 
-1. `/atomgit` 固定按 `source=atomgit-action` 过滤。
-2. `/atomgit` **支持分页**，主路由不分页（保持原有全量返回行为）。
+两个路由共享同一套过滤参数（`start_time` / `end_time` / `match_mode` / `status` / `name_prefix` / `cluster`），下方「请求参数」章节通用。差异仅两点：
+
+1. `/atomgit` 在过滤条件上**额外固定** `source = atomgit-action`，调用方无需也无法传 `source`。
+2. `/atomgit` **支持分页**且响应多出 `total` / `limit` / `offset` 三个字段；主路由不分页、响应只有 `count` / `envs`。
+
+### 两个路由的输入输出对照
+
+| | `GET /api/v1/envs/history` | `GET /api/v1/envs/history/atomgit` |
+|---|---|---|
+| **必填输入** | `start_time`、`end_time` | 同左 |
+| **可选输入** | `match_mode`、`status`、`name_prefix`、`cluster` | 同左，外加 `limit`、`offset` |
+| **返回范围** | 全部来源 | 仅 `atomgit-action` |
+| **是否分页** | 否，返回时间窗口内全部记录 | 是，默认每页 1000 条 |
+| **输出顶层字段** | `count`、`envs` | `count`、`total`、`limit`、`offset`、`envs` |
+| **单条记录结构** | 完全一致（含 `source` 字段） | 完全一致 |
 
 ### `/atomgit` 分页参数
 
@@ -19,7 +32,7 @@
 | `limit` | integer | `1000` | 每页返回条数，取值范围 `1 ~ 5000`，越界返回 400 |
 | `offset` | integer | `0` | 跳过的记录数，不能为负，用于翻页（第 N 页 offset = (N-1) × limit） |
 
-分页响应在原 `count` / `envs` 基础上新增字段：
+分页响应在 `count` / `envs` 基础上新增：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -33,11 +46,31 @@
   "total": 9322,
   "limit": 1000,
   "offset": 0,
-  "envs": [ /* ... */ ]
+  "envs": [ /* ... 单条结构与主路由一致 ... */ ]
 }
 ```
 
 > `count` 是本页实际返回条数，`total` 是全部条数。当 `offset + count >= total` 时说明已到最后一页。
+
+### 快速用法示例
+
+```bash
+# 主路由：查某时间段全部来源的 Pod（一次性返回，注意大窗口数据量）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z"
+
+# atomgit 路由：查 AtomGit CI 的 Pod，第 1 页（默认每页 1000）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z"
+
+# atomgit 路由：翻页，每页 100 条取第 3 页（offset = 2 × 100）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&limit=100&offset=200"
+
+# atomgit 路由：结合 cluster 过滤缩小范围
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
+```
 
 ---
 
@@ -410,4 +443,28 @@ start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&cluster=gy006"
 # 按 Pod 名称前缀过滤
 curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&name_prefix=my-job-"
+```
+
+**AtomGit 路由分页遍历**（根据 `total` 翻完所有页）：
+
+```python
+import requests
+
+BASE = "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit"
+params = {
+    "start_time": "2026-09-20T00:00:00Z",
+    "end_time":   "2026-09-20T23:59:59Z",
+    "limit": 1000,
+    "offset": 0,
+}
+all_envs = []
+while True:
+    r = requests.get(BASE, params=params).json()
+    all_envs.extend(r["envs"])
+    # 已取到的条数 >= 总数，说明翻完了
+    if params["offset"] + r["count"] >= r["total"]:
+        break
+    params["offset"] += params["limit"]
+
+print(f"共 {len(all_envs)} 条 AtomGit CI 记录")
 ```
