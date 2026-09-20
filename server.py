@@ -169,8 +169,8 @@ _CREATE_INDEXES_SQL = [
 ]
 
 _MIGRATE_SQL = [
-    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'plain'",
-    "CREATE INDEX IF NOT EXISTS idx_source ON pod_history(source)",
+    # 加列必须在 _CREATE_INDEXES_SQL 之前执行（见 _init_db）；idx_source 由建索引统一负责
+    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'",
 ]
 
 _UPSERT_SQL = """
@@ -226,10 +226,12 @@ def _init_db():
     try:
         with conn.cursor() as cur:
             cur.execute(_CREATE_TABLE_SQL)
-            for idx_sql in _CREATE_INDEXES_SQL:
-                cur.execute(idx_sql)
+            # 迁移必须在建索引之前：存量表 CREATE TABLE IF NOT EXISTS 会跳过，
+            # source 列尚未存在，若先建 idx_source 会因 column 不存在而崩溃。
             for sql in _MIGRATE_SQL:
                 cur.execute(sql)
+            for idx_sql in _CREATE_INDEXES_SQL:
+                cur.execute(idx_sql)
         conn.commit()
     finally:
         _put_conn(conn)
@@ -1069,10 +1071,11 @@ def _runner_sync_loop():
 # 3.8.1 查询逻辑（SQL）
 # ──────────────────────────────────────────────────────────
 
-def _build_query(start_time: datetime, end_time: datetime,
+def _build_where(start_time: datetime, end_time: datetime,
                  status=None, match_mode: str = "created",
                  name_prefix: str = None, cluster_filter: str = None,
                  source_filter: str = None) -> tuple[str, list]:
+    """只构造 WHERE 子句和参数，SELECT/ORDER/LIMIT 由调用方拼接。"""
     conditions = []
     params = []
 
@@ -1118,8 +1121,7 @@ def _build_query(start_time: datetime, end_time: datetime,
         params.append(source_filter)
 
     where = " AND ".join(conditions)
-    sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
-    return sql, params
+    return where, params
 
 
 _JSON_FIELDS = ("groups", "extend_env_comments", "resource_summary", "npu_list")
@@ -1152,7 +1154,14 @@ def query_history(start_time: datetime, end_time: datetime,
                   match_mode: str = "created",
                   name_prefix: str = None,
                   cluster_filter: str = None,
-                  source_filter: str = None) -> list:
+                  source_filter: str = None,
+                  limit: int = None,
+                  offset: int = 0):
+    """查询历史记录。
+
+    - 不分页（limit is None）：返回 list[dict]，兼容主路由原有行为。
+    - 分页（limit 给定）：返回 (list[dict], total)，total 为满足条件的总条数。
+    """
     if MODE in ("collector", "standalone"):
         try:
             _flush_buffer()
@@ -1161,14 +1170,27 @@ def query_history(start_time: datetime, end_time: datetime,
             # connection; the HTTP client would get no response at all.
             log.warning(f"query_history 前 flush 失败（忽略）: {_flush_err}")
 
-    sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter, source_filter)
+    where, params = _build_where(start_time, end_time, status, match_mode,
+                                 name_prefix, cluster_filter, source_filter)
+
+    paginated = limit is not None
+    data_sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
+    data_params = list(params)
+    if paginated:
+        data_sql += " LIMIT %s OFFSET %s"
+        data_params.extend([limit, offset])
 
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(data_sql, data_params)
             rows = cur.fetchall()
             col_names = [d[0] for d in cur.description]
+            total = None
+            if paginated:
+                # 分页时额外查总数（走 source/created_at 索引，开销远小于取全量行）
+                cur.execute(f"SELECT COUNT(*) FROM pod_history WHERE {where}", params)
+                total = cur.fetchone()[0]
         conn.commit()
     except Exception:
         _put_conn(conn, error=True)
@@ -1176,7 +1198,10 @@ def query_history(start_time: datetime, end_time: datetime,
     else:
         _put_conn(conn)
 
-    return _rows_to_records(rows, col_names)
+    records = _rows_to_records(rows, col_names)
+    if paginated:
+        return records, total
+    return records
 
 
 # ──────────────────────────────────────────────────────────
@@ -1235,10 +1260,30 @@ class Handler(BaseHTTPRequestHandler):
             if match_mode not in ("created", "released", "overlap"):
                 return self._err("match_mode 取值: created / released / overlap")
 
+            is_atomgit = path.endswith("/atomgit")
             # /atomgit 路由固定只返回 atomgit-action 来源的记录
-            source_filter = "atomgit-action" if path.endswith("/atomgit") else None
+            source_filter = "atomgit-action" if is_atomgit else None
 
-            envs = query_history(
+            # 仅 /atomgit 路由支持分页；主路由保持原有全量返回行为不变
+            limit = offset = None
+            if is_atomgit:
+                limit, offset = 1000, 0
+                if params.get("limit"):
+                    try:
+                        limit = int(params["limit"][0])
+                    except ValueError:
+                        return self._err("limit 必须为整数")
+                    if limit < 1 or limit > 5000:
+                        return self._err("limit 取值范围: 1 ~ 5000")
+                if params.get("offset"):
+                    try:
+                        offset = int(params["offset"][0])
+                    except ValueError:
+                        return self._err("offset 必须为整数")
+                    if offset < 0:
+                        return self._err("offset 不能为负数")
+
+            result = query_history(
                 start_time=start_time,
                 end_time=end_time,
                 status=status_filter,
@@ -1246,10 +1291,27 @@ class Handler(BaseHTTPRequestHandler):
                 name_prefix=name_prefix,
                 cluster_filter=cluster_filter,
                 source_filter=source_filter,
+                limit=limit,
+                offset=offset,
             )
+
+            if is_atomgit:
+                envs, total = result
+                clean_envs = [
+                    {k: v for k, v in e.items() if not k.startswith("_")}
+                    for e in envs
+                ]
+                return self._ok({
+                    "count": len(clean_envs),
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "envs": clean_envs,
+                })
+
             clean_envs = [
                 {k: v for k, v in e.items() if not k.startswith("_")}
-                for e in envs
+                for e in result
             ]
             return self._ok({"count": len(clean_envs), "envs": clean_envs})
 

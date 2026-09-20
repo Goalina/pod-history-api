@@ -7,7 +7,37 @@
 | `GET /api/v1/envs/history` | 查询全部来源的 Pod 历史记录（行为与历史版本一致） |
 | `GET /api/v1/envs/history/atomgit` | 仅查询 AtomGit CI（`source=atomgit-action`）拉起的 Pod，参数与主路由完全一致 |
 
-两个路由共享同一套查询逻辑与参数，唯一区别是 `/atomgit` 固定按 `source=atomgit-action` 过滤。
+两个路由共享同一套查询逻辑与参数，区别有二：
+
+1. `/atomgit` 固定按 `source=atomgit-action` 过滤。
+2. `/atomgit` **支持分页**，主路由不分页（保持原有全量返回行为）。
+
+### `/atomgit` 分页参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `limit` | integer | `1000` | 每页返回条数，取值范围 `1 ~ 5000`，越界返回 400 |
+| `offset` | integer | `0` | 跳过的记录数，不能为负，用于翻页（第 N 页 offset = (N-1) × limit） |
+
+分页响应在原 `count` / `envs` 基础上新增字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `total` | integer | 满足过滤条件的**总条数**（不受分页影响），用于计算总页数 |
+| `limit` | integer | 本次生效的每页条数 |
+| `offset` | integer | 本次生效的偏移量 |
+
+```json
+{
+  "count": 1000,
+  "total": 9322,
+  "limit": 1000,
+  "offset": 0,
+  "envs": [ /* ... */ ]
+}
+```
+
+> `count` 是本页实际返回条数，`total` 是全部条数。当 `offset + count >= total` 时说明已到最后一页。
 
 ---
 

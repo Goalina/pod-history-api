@@ -13,13 +13,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
   - `unknown`：来源无法识别的 Pod
 - 新增 AtomGit CI pod 的 `extend_env_comments` 提取：直接从 `octopus.io/` 前缀 annotation 读取 9 个字段（`repository`、`organization`、`repository_url`、`workflow_ref`、`pipeline_id`、`pipeline_run_id`、`job_display_name`、`job_external_id`、`project_id`），无需额外 K8s API 调用
 - 新增路由 `GET /api/v1/envs/history/atomgit`：固定只返回 `source=atomgit-action` 的记录，参数与原路由完全一致，不影响原有接口行为
+- `/atomgit` 路由支持分页：`limit`（默认 1000，范围 1~5000）+ `offset`（默认 0），响应新增 `total`（满足条件的总条数）、`limit`、`offset` 字段。主路由不分页，行为保持不变
 
 ### Changed
 - `source` 列已加入 DB schema（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），存量记录默认值为 `unknown`，服务启动时自动迁移，无需手动执行 SQL
 - ARC source 判断从依赖 Pod 名字后缀改为依赖可靠的 label（`actions-ephemeral-runner`、`runner-pod`）
+- `_build_query` 拆分为 `_build_where`（只出 WHERE 子句），SELECT/ORDER/LIMIT 由 `query_history` 拼接，以支持分页与 COUNT 复用同一套过滤条件
 
-### TODO
-- 接口分页（`limit` / `offset`）：当前 7 天查询返回 35 万行、耗时 23s，无分页保护在大时间窗口下会打爆 API server 内存和连接池，需作为下一个 PR 优先处理
+### Fixed
+- `_init_db` 迁移顺序：`ALTER TABLE ADD COLUMN source` 必须在 `CREATE INDEX idx_source` 之前执行。原顺序在存量表（`CREATE TABLE IF NOT EXISTS` 跳过）上会因 `source` 列不存在导致建索引崩溃、服务无法启动
+- `_MIGRATE_SQL` 中 `source` 默认值 `'plain'` 更正为 `'unknown'`，与建表 SQL 一致；去掉其中重复的 `idx_source` 建索引（统一由 `_CREATE_INDEXES_SQL` 负责）
 
 ---
 
