@@ -151,6 +151,7 @@ _CREATE_TABLE_SQL = """
         resource_summary TEXT DEFAULT '{}',
         node_ip TEXT DEFAULT '',
         npu_list TEXT DEFAULT '[]',
+        source TEXT DEFAULT 'unknown',
         _namespace TEXT DEFAULT '',
         _node TEXT DEFAULT '',
         _image TEXT DEFAULT '',
@@ -164,14 +165,20 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_created_at ON pod_history(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_cluster ON pod_history(cluster)",
     "CREATE INDEX IF NOT EXISTS idx_name ON pod_history(name)",
+    "CREATE INDEX IF NOT EXISTS idx_source ON pod_history(source)",
+]
+
+_MIGRATE_SQL = [
+    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'plain'",
+    "CREATE INDEX IF NOT EXISTS idx_source ON pod_history(source)",
 ]
 
 _UPSERT_SQL = """
     INSERT INTO pod_history
         (env_id, name, cluster, status, created_at, expires_at, ttl_seconds, duration,
          wait_duration, groups, extend_env_comments, resource_summary,
-         node_ip, npu_list, _namespace, _node, _image, _exit_code, _updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         node_ip, npu_list, source, _namespace, _node, _image, _exit_code, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (env_id) DO UPDATE SET
         name = EXCLUDED.name,
         cluster = EXCLUDED.cluster,
@@ -188,6 +195,7 @@ _UPSERT_SQL = """
         resource_summary = EXCLUDED.resource_summary,
         node_ip = EXCLUDED.node_ip,
         npu_list = EXCLUDED.npu_list,
+        source = EXCLUDED.source,
         _namespace = EXCLUDED._namespace,
         _node = EXCLUDED._node,
         _image = EXCLUDED._image,
@@ -220,6 +228,8 @@ def _init_db():
             cur.execute(_CREATE_TABLE_SQL)
             for idx_sql in _CREATE_INDEXES_SQL:
                 cur.execute(idx_sql)
+            for sql in _MIGRATE_SQL:
+                cur.execute(sql)
         conn.commit()
     finally:
         _put_conn(conn)
@@ -332,6 +342,7 @@ def _flush_buffer():
                     json.dumps(r.get("resource_summary", {}), ensure_ascii=False),
                     r.get("node_ip", ""),
                     json.dumps(r.get("npu_list", []), ensure_ascii=False),
+                    r.get("source", "unknown"),
                     r.get("_namespace", ""),
                     r.get("_node", ""),
                     r.get("_image", ""),
@@ -376,6 +387,21 @@ def _get_exit_code(status) -> int | None:
 
 
 _NPU_RE = re.compile(r'ascend|npu|gpu', re.IGNORECASE)
+
+_OCTOPUS_ANNOTATION_MAP = {
+    "octopus.io/pc-repository":       "repository",
+    "octopus.io/pc-repository-owner": "organization",
+    "octopus.io/pc-repository-url":   "repository_url",
+    "octopus.io/pc-ref-name":         "ref_name",
+    "octopus.io/pc-workflow-ref":     "workflow_ref",
+    "octopus.io/pc-pipeline-id":      "pipeline_id",
+    "octopus.io/pc-pipeline-run-id":  "pipeline_run_id",
+    "octopus.io/job-name":            "job_display_name",
+    "octopus.io/job-run-id":          "job_run_id",
+    "octopus.io/job-external-id":     "job_external_id",
+    "octopus.io/runner-set-name":     "runner_set_name",
+    "octopus.io/project-id":          "project_id",
+}
 
 
 def _parse_npu(reqs):
@@ -469,36 +495,55 @@ def _extract_record(pod) -> dict | None:
     resource_summary = {"total_devices": len(devices), "devices": devices} if devices else {}
     groups = {meta.namespace: {"device_count": len(devices)}}
 
-    extend_env_comments = {}
-    if meta.name.endswith("-workflow") and _k8s_custom:
-        runner_name = meta.name[: -len("-workflow")]
-        try:
-            runner = _k8s_custom.get_namespaced_custom_object(
-                group="actions.github.com",
-                version="v1alpha1",
-                namespace=meta.namespace,
-                plural="ephemeralrunners",
-                name=runner_name,
-            )
-            rs = runner.get("status", {})
-            rl = runner.get("metadata", {}).get("labels", {})
-            extend_env_comments = {
-                "workflow_ref": rs.get("jobWorkflowRef", ""),
-                "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
-                "job_display_name": rs.get("jobDisplayName", ""),
-                "job_id": rs.get("jobId", ""),
-                "job_repository": rs.get("jobRepositoryName", ""),
-                "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
-                "organization": rl.get("actions.github.com/organization", ""),
-                "repository": rl.get("actions.github.com/repository", ""),
-            }
-            extend_env_comments = {k: v for k, v in extend_env_comments.items() if v}
-            if extend_env_comments:
-                log.info(f"  EphemeralRunner {runner_name}: job={extend_env_comments.get('job_display_name', '')}")
-        except Exception as e:
-            log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
-
     annotations = meta.annotations or {}
+    labels = meta.labels or {}
+
+    # 判断 source，按可靠的 label/annotation，不依赖名字
+    if annotations.get("octopus.io/job-run-id"):
+        source = "atomgit-action"
+    elif labels.get("actions-ephemeral-runner") == "True" or labels.get("runner-pod"):
+        source = "github-action"
+    else:
+        source = "unknown"
+
+    # Octopus/AtomGit CI pod 直接从 annotation 读 extend_env_comments
+    # ARC workflow pod 由 _sync_ephemeral_runners 异步填充，_extract_record 时先置空
+    if source == "atomgit-action":
+        extend_env_comments = {
+            v: annotations[k]
+            for k, v in _OCTOPUS_ANNOTATION_MAP.items()
+            if annotations.get(k)
+        }
+        log.info(f"  AtomGit CI pod {meta.name}: job={extend_env_comments.get('job_display_name', '')}")
+    else:
+        extend_env_comments = {}
+        if meta.name.endswith("-workflow") and _k8s_custom:
+            runner_name = meta.name[: -len("-workflow")]
+            try:
+                runner = _k8s_custom.get_namespaced_custom_object(
+                    group="actions.github.com",
+                    version="v1alpha1",
+                    namespace=meta.namespace,
+                    plural="ephemeralrunners",
+                    name=runner_name,
+                )
+                rs = runner.get("status", {})
+                rl = runner.get("metadata", {}).get("labels", {})
+                extend_env_comments = {
+                    "workflow_ref": rs.get("jobWorkflowRef", ""),
+                    "workflow_run_id": str(rs.get("workflowRunId", "")) if rs.get("workflowRunId") else "",
+                    "job_display_name": rs.get("jobDisplayName", ""),
+                    "job_id": rs.get("jobId", ""),
+                    "job_repository": rs.get("jobRepositoryName", ""),
+                    "runner_id": str(rs.get("runnerId", "")) if rs.get("runnerId") else "",
+                    "organization": rl.get("actions.github.com/organization", ""),
+                    "repository": rl.get("actions.github.com/repository", ""),
+                }
+                extend_env_comments = {k: v for k, v in extend_env_comments.items() if v}
+                if extend_env_comments:
+                    log.info(f"  EphemeralRunner {runner_name}: job={extend_env_comments.get('job_display_name', '')}")
+            except Exception as e:
+                log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
 
     return {
         "env_id":              meta.uid,
@@ -515,6 +560,7 @@ def _extract_record(pod) -> dict | None:
         "resource_summary":    resource_summary,
         "node_ip":             (status.host_ip or "") if status else "",
         "npu_list":            _parse_npu_list(annotations),
+        "source":              source,
         "_namespace":          meta.namespace,
         "_node":               (spec.node_name or ""),
         "_image":              (spec.containers[0].image if spec.containers else ""),
@@ -1028,7 +1074,8 @@ def _runner_sync_loop():
 
 def _build_query(start_time: datetime, end_time: datetime,
                  status=None, match_mode: str = "created",
-                 name_prefix: str = None, cluster_filter: str = None) -> tuple[str, list]:
+                 name_prefix: str = None, cluster_filter: str = None,
+                 source_filter: str = None) -> tuple[str, list]:
     conditions = []
     params = []
 
@@ -1069,6 +1116,10 @@ def _build_query(start_time: datetime, end_time: datetime,
         conditions.append("cluster = %s")
         params.append(cluster_filter)
 
+    if source_filter:
+        conditions.append("source = %s")
+        params.append(source_filter)
+
     where = " AND ".join(conditions)
     sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
     return sql, params
@@ -1103,7 +1154,8 @@ def query_history(start_time: datetime, end_time: datetime,
                   status=None,
                   match_mode: str = "created",
                   name_prefix: str = None,
-                  cluster_filter: str = None) -> list:
+                  cluster_filter: str = None,
+                  source_filter: str = None) -> list:
     if MODE in ("collector", "standalone"):
         try:
             _flush_buffer()
@@ -1112,7 +1164,7 @@ def query_history(start_time: datetime, end_time: datetime,
             # connection; the HTTP client would get no response at all.
             log.warning(f"query_history 前 flush 失败（忽略）: {_flush_err}")
 
-    sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter)
+    sql, params = _build_query(start_time, end_time, status, match_mode, name_prefix, cluster_filter, source_filter)
 
     conn = _get_conn()
     try:
@@ -1182,9 +1234,13 @@ class Handler(BaseHTTPRequestHandler):
             match_mode     = params.get("match_mode",  ["created"])[0]
             name_prefix    = params.get("name_prefix", [None])[0]
             cluster_filter = params.get("cluster",     [None])[0]
+            source_filter  = params.get("source",      [None])[0]
 
             if match_mode not in ("created", "released", "overlap"):
                 return self._err("match_mode 取值: created / released / overlap")
+
+            if source_filter and source_filter not in ("github-action", "atomgit-action", "unknown"):
+                return self._err("source 取值: github-action / atomgit-action / unknown")
 
             envs = query_history(
                 start_time=start_time,
@@ -1193,6 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                 match_mode=match_mode,
                 name_prefix=name_prefix,
                 cluster_filter=cluster_filter,
+                source_filter=source_filter,
             )
             clean_envs = [
                 {k: v for k, v in e.items() if not k.startswith("_")}
