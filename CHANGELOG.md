@@ -7,10 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
-- 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后关联到同期存活的 `-workflow` job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/workflow 代码
-  - 匹配依据全部来自 pod 自身：worker 的 name/env/command 归一化 token 与 job 的 `job_display_name` 求交，只计在候选 job 中唯一出现（df==1）的 token；再叠加时间窗口（job 先于 worker 创建、不早于 worker 结束、且不超过 24h）
-  - 仅当最高分唯一且达到阈值才写入，否则保持 `unknown`，不硬猜；同一 config 并发多 job 时会因最高分不唯一而跳过
-- 新增内部列 `_worker_kind`（`lws` / `volcano`）与 `_worker_tokens`，随建表/迁移自动创建，不对外暴露
+- 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后在 DB 中关联到同 cluster 有工作流信息的 job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/业务代码
+  - **路径 A — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，与 job 的 `job_display_name` 括号内第二段（matrix_name，vllm-ascend 专用格式）精确比较（`bench == matrix` 或 `bench.endswith("-" + matrix)`，兼容任意分支名）；实测 gy-005 集群 4/4 命中，零误配
+  - **路径 B — token 匹配 fallback**（sglang Volcano 等无 BENCHMARK_JOB_NAME 场景）：从 pod name/command/env 提取归一化 token，只计在候选 job 中唯一出现（df==1）的 token 计分，唯一最高分（≥5）才写入
+  - 时间窗口：job 先于 worker 创建（5min 余量），差值不超过 24h；两路均保守，无唯一匹配时保持 `unknown`
+  - **当前覆盖范围**：github-action 来源的 job pod（vllm-ascend / sglang）；atomgit-action 多机场景生产暂未出现，若出现走路径 B，届时需验证
+- 新增内部列 `_worker_kind`（`lws` / `volcano`）与 `_worker_tokens`（LWS 存 `BENCHMARK_JOB_NAME` 原始值；Volcano 等存 token 串），随建表/迁移自动创建，不对外暴露
 - 新增 `source` 字段（`github-action` / `atomgit-action` / `unknown`），在写入时由 `_extract_record` 按 label/annotation 判断填充：
   - `github-action`：Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod）
   - `atomgit-action`：Pod 带 `octopus.io/job-run-id` annotation（AtomGit/GitCode CI 拉起）
