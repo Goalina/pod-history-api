@@ -1170,33 +1170,40 @@ _WORKER_MATCH_MIN_SCORE = 5
 
 # vllm-ascend 专用：job_display_name 格式固定为
 # "{type} ({branch}, {matrix_name}, {yaml}, {path})"
-# 括号内第二段是 matrix_name，用于与 BENCHMARK_JOB_NAME 精确匹配。
+# 括号内第 1 段是 branch、第 2 段是 matrix_name，用于与 BENCHMARK_JOB_NAME 精确匹配。
 # 其他 CI（sglang 等）格式不同，不能用此正则，走 token fallback。
-_MATRIX_NAME_RE = re.compile(r'\([^,]+,\s*([^,]+),')
+_DISPLAY_PARTS_RE = re.compile(r'\(([^,]*),\s*([^,]*),')
 
 
-def _extract_matrix_name(job_display_name: str) -> str:
-    """从 vllm-ascend job_display_name 提取 matrix_name（括号内第二段）。"""
+def _extract_display_parts(job_display_name: str) -> tuple:
+    """从 vllm-ascend job_display_name 提取 (branch, matrix_name)。
+
+    形如 "double-node (main, multi-node-qwen-disagg-pd, ...)"
+    → ("main", "multi-node-qwen-disagg-pd")。解析失败返回 ("", "")。
+    """
     if not job_display_name:
-        return ""
-    m = _MATRIX_NAME_RE.search(job_display_name)
-    return m.group(1).strip() if m else ""
+        return "", ""
+    m = _DISPLAY_PARTS_RE.search(job_display_name)
+    if not m:
+        return "", ""
+    return m.group(1).strip(), m.group(2).strip()
 
 
-def _bench_matches(bench_raw: str, matrix_name: str) -> bool:
-    """判断 BENCHMARK_JOB_NAME 原始值与 matrix_name 是否匹配（大小写不敏感）。
+def _bench_matches(bench_raw: str, branch: str, matrix_name: str) -> bool:
+    """判断 BENCHMARK_JOB_NAME 与 (branch, matrix_name) 是否精确匹配（大小写不敏感）。
 
-    匹配规则（两者均满足其一即可）：
-      1. bench == matrix：BENCHMARK_JOB_NAME 本身就是 matrix_name（无分支前缀）
-      2. bench.endswith("-" + matrix)：bench 带有任意分支前缀（main-、v0.11.0-dev- 等）
-
-    不做 split('-',1) 是因为分支名本身可能含 -（如 v0.11.0-dev、release-1.0），
-    CI 脚本还会把 / tr 成 -，split 会截出错误的 key。
+    CI 规则：BENCHMARK_JOB_NAME = "{branch}-{matrix_name}"。
+      - 解析到 branch 时：按 "{branch}-{matrix_name}" 精确重建比较。分支名含 -、
+        CI 把 / tr 成 - 都无所谓（不做 split），也避免"某个 matrix 是另一个后缀"
+        的碰撞（如 qwen-disagg-pd vs multi-node-qwen-disagg-pd）。
+      - 解析不到 branch 时：退化为 bench == matrix 或 bench.endswith("-" + matrix)。
     """
     if not bench_raw or not matrix_name:
         return False
-    b = bench_raw.lower()
-    m = matrix_name.lower()
+    b = bench_raw.strip().lower()
+    m = matrix_name.strip().lower()
+    if branch:
+        return b == f"{branch.strip().lower()}-{m}"
     return b == m or b.endswith("-" + m)
 
 
@@ -1237,8 +1244,9 @@ def _sync_worker_pods():
     两路匹配策略，均基于 pod 自身信息，不依赖 CI/业务代码修改：
 
     路径 A — BENCHMARK_JOB_NAME 精确匹配（vllm-ascend LWS）：
-      _worker_tokens 存 BENCHMARK_JOB_NAME 原始值，与 job_display_name 括号内
-      第二段（matrix_name）精确匹配。兼容任意分支名，4/4 实测零误配。
+      _worker_tokens 存 BENCHMARK_JOB_NAME 原始值，用 job_display_name 括号内的
+      (branch, matrix_name) 重建 "{branch}-{matrix_name}" 精确比较，兼容任意分支名
+      且无后缀碰撞；4/4 实测零误配。
       注：job_display_name 解析格式为 vllm-ascend 专用。
 
     路径 B — token 匹配 fallback（无 BENCHMARK_JOB_NAME 的场景，如 sglang Volcano）：
@@ -1280,7 +1288,7 @@ def _sync_worker_pods():
     if not workers:
         return
 
-    # 预处理 job：同时提取 matrix_name（路径 A）和 token 集合（路径 B）
+    # 预处理 job：同时提取 (branch, matrix_name)（路径 A）和 token 集合（路径 B）
     jobs = []
     for env_id, _name, created, expires, source, comments_json in job_rows:
         try:
@@ -1288,12 +1296,13 @@ def _sync_worker_pods():
         except (json.JSONDecodeError, TypeError):
             comments = {}
         jdn = comments.get("job_display_name", "")
-        matrix_name = _extract_matrix_name(jdn)
+        branch, matrix_name = _extract_display_parts(jdn)
         toks = _tokenize(jdn or comments.get("workflow_ref", ""))
         if not matrix_name and not toks:
             continue
         jobs.append({
             "env_id":      env_id,
+            "branch":      branch,
             "matrix_name": matrix_name,
             "created":     parse_iso(str(created)) if created else None,
             "expires":     parse_iso(str(expires)) if expires else None,
@@ -1322,7 +1331,7 @@ def _sync_worker_pods():
             for j in jobs:
                 if not j["matrix_name"]:
                     continue
-                if not _bench_matches(worker_tokens, j["matrix_name"]):
+                if not _bench_matches(worker_tokens, j.get("branch", ""), j["matrix_name"]):
                     continue
                 if j["created"] and w_created:
                     if j["created"] > w_created + timedelta(minutes=5):

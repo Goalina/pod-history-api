@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 
 ### Added
 - 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后在 DB 中关联到同 cluster 有工作流信息的 job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/业务代码
-  - **路径 A — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，与 job 的 `job_display_name` 括号内第二段（matrix_name，vllm-ascend 专用格式）精确比较（`bench == matrix` 或 `bench.endswith("-" + matrix)`，兼容任意分支名）；实测 gy-005 集群 4/4 命中，零误配
+  - **路径 A — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，用 job 的 `job_display_name` 括号内 `(branch, matrix_name)` 重建 `"{branch}-{matrix_name}"` 精确比较（vllm-ascend 专用格式）；兼容任意分支名（含 `-`），且避免"某个 matrix 是另一个后缀"的碰撞；实测 gy-005 集群 4/4 命中，零误配
   - **路径 B — token 匹配 fallback**（sglang Volcano 等无 BENCHMARK_JOB_NAME 场景）：从 pod name/command/env 提取归一化 token，只计在候选 job 中唯一出现（df==1）的 token 计分，唯一最高分（≥5）才写入
   - 时间窗口：job 先于 worker 创建（5min 余量），差值不超过 24h；两路均保守，无唯一匹配时保持 `unknown`
   - **当前覆盖范围**：github-action 来源的 job pod（vllm-ascend / sglang）；atomgit-action 多机场景生产暂未出现，若出现走路径 B，届时需验证
