@@ -444,10 +444,41 @@ def _parse_npu_list(annotations: dict) -> list:
 # 多机 CI worker pod 识别（LWS / Volcano Job 等）
 # ──────────────────────────────────────────────────────────
 # 这些 pod 由 K8s 控制器（LeaderWorkerSet / Volcano 等）创建，K8s 不保存
-# 发起创建它们的 CI job pod 身份。这里记录 pod 的 BENCHMARK_JOB_NAME env，
-# 由 _sync_worker_pods 事后与 DB 中 -workflow job pod 的 job_display_name 精确匹配。
+# 发起创建它们的 CI job pod 身份。_worker_tokens 列存储：
+#   - LWS pod（vllm-ascend）：BENCHMARK_JOB_NAME 原始值，用于精确匹配
+#   - Volcano pod（sglang 等）：name/command/env token 集合，用于 token 匹配 fallback
+# 由 _sync_worker_pods 事后与 DB 中 job pod 的 job_display_name 关联。
 
-_WORKER_TOKEN_CAP = 200
+_WORKER_TOKEN_MIN_LEN = 4
+_WORKER_TOKEN_CAP     = 4000
+
+_WORKER_STOPWORDS = {
+    "true", "false", "none", "null", "default", "scheduler", "kubernetes",
+    "container", "containers", "value", "valuefrom", "fieldref", "metadata",
+    "path", "config", "test", "tests", "main", "nightly", "multi", "node",
+    "project", "image", "always", "running", "pending", "succeeded", "failed",
+    "unknown", "please", "http", "https", "github", "gitcode", "com", "cn",
+    "swr", "base", "dockerhub", "local", "root", "cache", "data", "workspace",
+    "driver", "tools", "ascend", "sglang", "vllm", "aten", "cann", "yaml",
+    "runner", "build", "ubuntu", "python", "latest", "linux", "aarch64",
+    "amd64", "arm64", "x86", "docker", "mirror", "tuna", "tsinghua", "edu",
+}
+
+_TOKEN_RE = re.compile(r'[a-z0-9]+')
+
+
+def _tokenize(text: str) -> set:
+    """归一化文本为去重 token 集合（小写、去通用词、去纯数字/过短）。"""
+    if not text:
+        return set()
+    toks = set()
+    for t in _TOKEN_RE.findall(text.lower()):
+        if len(t) < _WORKER_TOKEN_MIN_LEN or t.isdigit():
+            continue
+        if t in _WORKER_STOPWORDS:
+            continue
+        toks.add(t)
+    return toks
 
 
 def _worker_kind(pod) -> str:
@@ -462,23 +493,37 @@ def _worker_kind(pod) -> str:
 
 
 def _worker_bench_key(pod) -> str:
-    """从 pod env 读取 BENCHMARK_JOB_NAME，去掉 {branch}- 前缀得到 bench_key。
+    """从 pod env 读取 BENCHMARK_JOB_NAME 原始值（vllm-ascend LWS 专用）。
 
-    CI 脚本生成规则：BENCHMARK_JOB_NAME = "{branch}-{matrix_name}"
-    例：main-QWEN3_235B_PD → QWEN3_235B_PD
-
-    bench_key 将与 job_display_name 括号内第二段（matrix_name）做精确匹配。
-    去掉分支前缀而非硬编码 "main-"，兼容任意分支名（feat-xxx、release-1.0 等）。
+    存储原始值而非 strip 分支前缀，匹配时用 endswith 兼容任意分支名。
+    分支名含 / 时 CI 脚本会 tr '/' '-'，本身也可能含 -，故不能用 split('-',1)。
+    例：v0.11.0-dev-QWEN3_235B_PD → 原始值，匹配时 endswith('-QWEN3_235B_PD')。
     """
     for c in (pod.spec.containers or []):
         for e in (c.env or []):
             if e.name == "BENCHMARK_JOB_NAME" and e.value:
-                raw = e.value.strip()
-                # 去掉第一个 "-" 前的分支名
-                if "-" in raw:
-                    return raw.split("-", 1)[1][:_WORKER_TOKEN_CAP]
-                return raw[:_WORKER_TOKEN_CAP]
+                return e.value.strip()
     return ""
+
+
+def _worker_tokens_from_pod(pod) -> str:
+    """收集 worker pod 的 token（name/command/env），用于 token fallback 匹配。
+
+    适用于没有 BENCHMARK_JOB_NAME 的场景（如 sglang Volcano pod）。
+    env 里过长的值（JSON、设备配置等）不参与，避免噪声。
+    """
+    parts = [pod.metadata.name or ""]
+    spec = pod.spec
+    for c in (spec.containers or []):
+        if c.command:
+            parts.extend(c.command)
+        if c.args:
+            parts.extend(c.args)
+        for e in (c.env or []):
+            v = e.value
+            if v and len(v) <= 200 and not v.startswith(("{", "[")):
+                parts.append(v)
+    return " ".join(sorted(_tokenize(" ".join(parts))))[:_WORKER_TOKEN_CAP]
 
 
 def _extract_record(pod) -> dict | None:
@@ -597,7 +642,12 @@ def _extract_record(pod) -> dict | None:
                 log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
 
     worker_kind = _worker_kind(pod)
-    worker_tokens = _worker_bench_key(pod) if worker_kind else ""
+    if worker_kind == "lws":
+        worker_tokens = _worker_bench_key(pod) or _worker_tokens_from_pod(pod)
+    elif worker_kind:
+        worker_tokens = _worker_tokens_from_pod(pod)
+    else:
+        worker_tokens = ""
 
     return {
         "env_id":              meta.uid,
@@ -1115,60 +1165,106 @@ def _sync_remote_workflow_pods(runner_map: dict):
     _put_conn(conn)
 
 
-_WORKER_MATCH_MAX_AGE = timedelta(hours=24)
+_WORKER_MATCH_MAX_AGE   = timedelta(hours=24)
+_WORKER_MATCH_MIN_SCORE = 5
 
-# job_display_name 固定格式："{type} ({branch}, {matrix_name}, {yaml}, {path})"
-# 括号内第二段就是 matrix_name，与 bench_key 精确匹配
+# vllm-ascend 专用：job_display_name 格式固定为
+# "{type} ({branch}, {matrix_name}, {yaml}, {path})"
+# 括号内第二段是 matrix_name，用于与 BENCHMARK_JOB_NAME 精确匹配。
+# 其他 CI（sglang 等）格式不同，不能用此正则，走 token fallback。
 _MATRIX_NAME_RE = re.compile(r'\([^,]+,\s*([^,]+),')
 
 
 def _extract_matrix_name(job_display_name: str) -> str:
-    """从 job_display_name 提取 matrix_name（括号内第二段）。"""
+    """从 vllm-ascend job_display_name 提取 matrix_name（括号内第二段）。"""
     if not job_display_name:
         return ""
     m = _MATRIX_NAME_RE.search(job_display_name)
     return m.group(1).strip() if m else ""
 
 
+def _bench_matches(bench_raw: str, matrix_name: str) -> bool:
+    """判断 BENCHMARK_JOB_NAME 原始值与 matrix_name 是否匹配（大小写不敏感）。
+
+    匹配规则（两者均满足其一即可）：
+      1. bench == matrix：BENCHMARK_JOB_NAME 本身就是 matrix_name（无分支前缀）
+      2. bench.endswith("-" + matrix)：bench 带有任意分支前缀（main-、v0.11.0-dev- 等）
+
+    不做 split('-',1) 是因为分支名本身可能含 -（如 v0.11.0-dev、release-1.0），
+    CI 脚本还会把 / tr 成 -，split 会截出错误的 key。
+    """
+    if not bench_raw or not matrix_name:
+        return False
+    b = bench_raw.lower()
+    m = matrix_name.lower()
+    return b == m or b.endswith("-" + m)
+
+
+def _best_job_for_worker(wtoks: set, w_created: datetime, jobs: list, df: dict):
+    """token fallback：在候选 job 中为 worker 选唯一最佳匹配。
+
+    只计在所有候选 job 中唯一出现（df==1）的 token，避免通用词误配。
+    最高分不唯一或未达阈值时返回 None，不硬猜。
+    """
+    if not wtoks or not w_created:
+        return None
+    scored = []
+    for j in jobs:
+        if j["created"]:
+            if j["created"] > w_created + timedelta(minutes=5):
+                continue
+            if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
+                continue
+        if j["expires"] and j["expires"] < w_created:
+            continue
+        score = sum(len(t) for t in (wtoks & j["tokens"]) if df.get(t, 0) == 1)
+        if score:
+            scored.append((score, j))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    score, best = scored[0]
+    if score < _WORKER_MATCH_MIN_SCORE:
+        return None
+    return score, best
+
+
 def _sync_worker_pods():
-    """把多机 CI worker pod（LWS / Volcano Job 等）关联到拉起它的 -workflow job pod。
+    """把多机 CI worker pod（LWS / Volcano Job 等）关联到拉起它的 job pod。
 
-    匹配策略（全部基于 pod 自身信息，不依赖 CI/业务代码）：
+    两路匹配策略，均基于 pod 自身信息，不依赖 CI/业务代码修改：
 
-    1. bench_key：从 LWS pod 的 BENCHMARK_JOB_NAME env 提取（存于 _worker_tokens），
-       去掉 "{branch}-" 前缀，得到 matrix_name 等价串，如 "QWEN3_235B_PD"。
+    路径 A — BENCHMARK_JOB_NAME 精确匹配（vllm-ascend LWS）：
+      _worker_tokens 存 BENCHMARK_JOB_NAME 原始值，与 job_display_name 括号内
+      第二段（matrix_name）精确匹配。兼容任意分支名，4/4 实测零误配。
+      注：job_display_name 解析格式为 vllm-ascend 专用。
 
-    2. matrix_name：从 -workflow pod 的 job_display_name 提取括号内第二段，
-       格式固定为 "{type} ({branch}, {matrix_name}, {yaml}, {path})"。
-
-    3. 精确匹配（大小写不敏感）：bench_key == matrix_name。
-       用精确匹配而非子串，防止 QWEN3_235B_PD 误匹配 QWEN3_235B_PD_3_5K_1_5k。
-
-    4. 时间窗口：job created_at <= worker created_at + 5min（job 先于 worker 存在），
-       且差值不超过 24h。
-
-    5. 唯一性：同一 worker 匹配到多个 job 时保持 unknown，不硬猜。
-
-    来源：通过实际集群数据（gy-005 vllm-project）验证，LWS pod 的 BENCHMARK_JOB_NAME
-    与 a3-800t workflow pod（经 Liqo 从 cn12-001 offload 到 gy-005，同 cluster）
-    的 job_display_name 精确对应，4/4 全部命中，零误配。
+    路径 B — token 匹配 fallback（无 BENCHMARK_JOB_NAME 的场景，如 sglang Volcano）：
+      _worker_tokens 存 name/command/env 归一化 token，只计 df==1 的唯一 token
+      计分，唯一最高分（>=5）才写入。命中率取决于 token 区分度，并发同类 job 时
+      可能匹配失败，保持 unknown（不误配）。
+      当前覆盖范围：github-action 来源的 job pod；atomgit-action 多机场景未见于
+      生产，若出现也会走此路径，但 atomgit job pod 名不含 -workflow，需届时验证。
     """
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
+            # 取所有待关联的 worker pod（有 _worker_kind，comments 为空）
             cur.execute(
                 "SELECT env_id, name, created_at, _worker_tokens FROM pod_history "
                 "WHERE cluster = %s AND _worker_kind <> '' "
                 "AND COALESCE(extend_env_comments, '{}') IN ('{}', '') "
-                "AND created_at <> '' AND _worker_tokens <> ''",
+                "AND created_at <> ''",
                 (CLUSTER_ID,),
             )
             workers = cur.fetchall()
+            # 取所有同 cluster 有工作流信息的 job pod（不限 namespace，不限 -workflow 后缀）
             cur.execute(
                 "SELECT env_id, name, created_at, expires_at, source, extend_env_comments "
                 "FROM pod_history "
                 "WHERE cluster = %s AND source IN ('github-action', 'atomgit-action') "
-                "AND name LIKE '%%-workflow' "
                 "AND COALESCE(extend_env_comments, '{}') NOT IN ('{}', '')",
                 (CLUSTER_ID,),
             )
@@ -1183,64 +1279,81 @@ def _sync_worker_pods():
     if not workers:
         return
 
-    # 预处理：提取每个 job 的 matrix_name 和时间
+    # 预处理 job：同时提取 matrix_name（路径 A）和 token 集合（路径 B）
     jobs = []
     for env_id, _name, created, expires, source, comments_json in job_rows:
         try:
             comments = json.loads(comments_json or "{}")
         except (json.JSONDecodeError, TypeError):
             comments = {}
-        matrix_name = _extract_matrix_name(comments.get("job_display_name", ""))
-        if not matrix_name:
+        jdn = comments.get("job_display_name", "")
+        matrix_name = _extract_matrix_name(jdn)
+        toks = _tokenize(jdn or comments.get("workflow_ref", ""))
+        if not matrix_name and not toks:
             continue
         jobs.append({
             "env_id":      env_id,
-            "matrix_name": matrix_name.lower(),
+            "matrix_name": matrix_name,
             "created":     parse_iso(str(created)) if created else None,
             "expires":     parse_iso(str(expires)) if expires else None,
             "source":      source,
             "comments":    comments,
+            "tokens":      toks,
         })
 
     if not jobs:
         return
 
+    # df 仅用于路径 B token 匹配
+    df = {}
+    for j in jobs:
+        for t in j["tokens"]:
+            df[t] = df.get(t, 0) + 1
+
     updates = []
-    for env_id, worker_name, created_at, bench_key in workers:
-        if not bench_key:
-            continue
+    for env_id, worker_name, created_at, worker_tokens in workers:
         w_created = parse_iso(str(created_at)) if created_at else None
-        bench_lower = bench_key.lower()
+        best = None
 
-        matched = []
-        for j in jobs:
-            if j["matrix_name"] != bench_lower:
-                continue
-            if j["created"] and w_created:
-                # job 必须早于 worker 创建（5min 余量）
-                if j["created"] > w_created + timedelta(minutes=5):
+        # 路径 A：BENCHMARK_JOB_NAME 精确匹配
+        if worker_tokens:
+            bench_matched = []
+            for j in jobs:
+                if not j["matrix_name"]:
                     continue
-                if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
+                if not _bench_matches(worker_tokens, j["matrix_name"]):
                     continue
-            if j["expires"] and w_created and j["expires"] < w_created:
-                continue
-            matched.append(j)
+                if j["created"] and w_created:
+                    if j["created"] > w_created + timedelta(minutes=5):
+                        continue
+                    if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
+                        continue
+                if j["expires"] and w_created and j["expires"] < w_created:
+                    continue
+                bench_matched.append(j)
+            if len(bench_matched) == 1:
+                best = bench_matched[0]
+                log.info(f"[多机关联/bench] {worker_name} -> {best['comments'].get('job_display_name', best['env_id'])}")
 
-        if len(matched) != 1:
-            # 无匹配或不唯一，保持 unknown 不硬猜
+        # 路径 B：token fallback（bench 无匹配时）
+        if best is None:
+            wtoks = set((worker_tokens or "").split()) if worker_tokens else set()
+            if not wtoks and worker_tokens:
+                wtoks = _tokenize(worker_tokens)
+            result = _best_job_for_worker(wtoks, w_created, jobs, df)
+            if result:
+                score, best = result
+                log.info(f"[多机关联/token] {worker_name} -> {best['comments'].get('job_display_name', best['env_id'])} (score={score})")
+
+        if best is None:
             continue
 
-        best = matched[0]
         updates.append((
             best["source"],
             json.dumps(best["comments"], ensure_ascii=False),
             now_utc().isoformat(),
             env_id,
         ))
-        log.info(
-            f"[多机关联] {worker_name} → "
-            f"{best['comments'].get('job_display_name', best['env_id'])}"
-        )
 
     if not updates:
         return
