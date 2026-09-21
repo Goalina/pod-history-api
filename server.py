@@ -1265,7 +1265,8 @@ def _sync_worker_pods():
                 "SELECT env_id, name, created_at, expires_at, source, extend_env_comments "
                 "FROM pod_history "
                 "WHERE cluster = %s AND source IN ('github-action', 'atomgit-action') "
-                "AND COALESCE(extend_env_comments, '{}') NOT IN ('{}', '')",
+                "AND COALESCE(extend_env_comments, '{}') NOT IN ('{}', '') "
+                "AND COALESCE(_worker_kind, '') = ''",
                 (CLUSTER_ID,),
             )
             job_rows = cur.fetchall()
