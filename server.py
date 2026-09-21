@@ -158,6 +158,7 @@ _CREATE_TABLE_SQL = """
         _exit_code INTEGER,
         _worker_kind TEXT DEFAULT '',
         _worker_tokens TEXT DEFAULT '',
+        _worker_run_id TEXT DEFAULT '',
         _updated_at TEXT NOT NULL
     )
 """
@@ -176,6 +177,7 @@ _MIGRATE_SQL = [
     # 多机 CI worker pod 识别/关联（LWS、Volcano Job 等）
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_kind TEXT DEFAULT ''",
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_tokens TEXT DEFAULT ''",
+    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_run_id TEXT DEFAULT ''",
 ]
 
 _UPSERT_SQL = """
@@ -183,8 +185,8 @@ _UPSERT_SQL = """
         (env_id, name, cluster, status, created_at, expires_at, ttl_seconds, duration,
          wait_duration, groups, extend_env_comments, resource_summary,
          node_ip, npu_list, source, _namespace, _node, _image, _exit_code,
-         _worker_kind, _worker_tokens, _updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         _worker_kind, _worker_tokens, _worker_run_id, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (env_id) DO UPDATE SET
         name = EXCLUDED.name,
         cluster = EXCLUDED.cluster,
@@ -209,6 +211,7 @@ _UPSERT_SQL = """
         _exit_code = EXCLUDED._exit_code,
         _worker_kind = EXCLUDED._worker_kind,
         _worker_tokens = EXCLUDED._worker_tokens,
+        _worker_run_id = EXCLUDED._worker_run_id,
         _updated_at = EXCLUDED._updated_at
 """
 
@@ -360,6 +363,7 @@ def _flush_buffer():
                     r.get("_exit_code"),
                     r.get("_worker_kind", ""),
                     r.get("_worker_tokens", ""),
+                    r.get("_worker_run_id", ""),
                     now_utc().isoformat(),
                 ) for r in records
             ])
@@ -648,6 +652,9 @@ def _extract_record(pod) -> dict | None:
         worker_tokens = _worker_tokens_from_pod(pod)
     else:
         worker_tokens = ""
+    # worker pod 上的 run-id label（sglang 多机 CI 会注入 = github.run_id），
+    # 可直接与 job pod 的 extend_env_comments.workflow_run_id 精确关联
+    worker_run_id = ((meta.labels or {}).get("run-id") or "").strip() if worker_kind else ""
 
     return {
         "env_id":              meta.uid,
@@ -671,6 +678,7 @@ def _extract_record(pod) -> dict | None:
         "_exit_code":          _get_exit_code(status) if is_terminal else None,
         "_worker_kind":        worker_kind,
         "_worker_tokens":      worker_tokens,
+        "_worker_run_id":      worker_run_id,
     }
 
 
@@ -943,7 +951,11 @@ def _initial_scan():
             phase = (pod.status.phase or "Unknown") if pod.status else "Unknown"
             if phase not in RUNNING_PHASES:
                 continue
-            if _is_running(pod.metadata.uid) or _is_terminal(pod.metadata.uid):
+            # 多机 worker pod 即使已在运行集合中，也重新提取一次：部署新版本后
+            # 为存量运行中的 worker 回填 _worker_kind/_worker_tokens/_worker_run_id，
+            # 让它们也能被 _sync_worker_pods 关联（upsert 会保留已有 comments/source）。
+            is_worker = _worker_kind(pod) != ""
+            if not is_worker and (_is_running(pod.metadata.uid) or _is_terminal(pod.metadata.uid)):
                 continue
             record = _extract_record(pod)
             if record:
@@ -1207,6 +1219,40 @@ def _bench_matches(bench_raw: str, branch: str, matrix_name: str) -> bool:
     return b == m or b.endswith("-" + m)
 
 
+def _in_worker_window(j, w_created: datetime) -> bool:
+    """job 是否落在 worker 关联的合理时间窗内。
+
+    job 必须早于 worker 创建（留 5min 余量）、不早于 worker 结束、且不超过 24h。
+    """
+    if not w_created:
+        return False
+    if j["created"]:
+        if j["created"] > w_created + timedelta(minutes=5):
+            return False
+        if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
+            return False
+    if j["expires"] and j["expires"] < w_created:
+        return False
+    return True
+
+
+def _latest_preceding(cands: list):
+    """精确命中多个时，取 worker 之前最近创建的那个；创建时间并列则放弃（不硬猜）。
+
+    同一 config 在窗口内重复运行时（如 qwen-disagg-pd 连跑两次），worker 总在
+    其父 job 启动后约 1 分钟内创建，取最近创建者可稳定消歧。
+    """
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    ranked = sorted(cands, key=lambda j: j["created"] or floor, reverse=True)
+    if ranked[0]["created"] == ranked[1]["created"]:
+        return None
+    return ranked[0]
+
+
 def _best_job_for_worker(wtoks: set, w_created: datetime, jobs: list, df: dict):
     """token fallback：在候选 job 中为 worker 选唯一最佳匹配。
 
@@ -1217,12 +1263,7 @@ def _best_job_for_worker(wtoks: set, w_created: datetime, jobs: list, df: dict):
         return None
     scored = []
     for j in jobs:
-        if j["created"]:
-            if j["created"] > w_created + timedelta(minutes=5):
-                continue
-            if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
-                continue
-        if j["expires"] and j["expires"] < w_created:
+        if not _in_worker_window(j, w_created):
             continue
         score = sum(len(t) for t in (wtoks & j["tokens"]) if df.get(t, 0) == 1)
         if score:
@@ -1241,27 +1282,32 @@ def _best_job_for_worker(wtoks: set, w_created: datetime, jobs: list, df: dict):
 def _sync_worker_pods():
     """把多机 CI worker pod（LWS / Volcano Job 等）关联到拉起它的 job pod。
 
-    两路匹配策略，均基于 pod 自身信息，不依赖 CI/业务代码修改：
+    三路匹配策略，均基于 pod 自身信息，不依赖 CI/业务代码修改：
 
-    路径 A — BENCHMARK_JOB_NAME 精确匹配（vllm-ascend LWS）：
+    路径 A1 — run-id label 精确匹配（sglang 多机 Volcano）：
+      worker pod 带 label run-id（= github.run_id，sglang 模板注入），与 job pod 的
+      extend_env_comments.workflow_run_id 精确相等即命中。确定性最高。
+
+    路径 A2 — BENCHMARK_JOB_NAME 精确匹配（vllm-ascend LWS）：
       _worker_tokens 存 BENCHMARK_JOB_NAME 原始值，用 job_display_name 括号内的
       (branch, matrix_name) 重建 "{branch}-{matrix_name}" 精确比较，兼容任意分支名
       且无后缀碰撞；4/4 实测零误配。
       注：job_display_name 解析格式为 vllm-ascend 专用。
 
-    路径 B — token 匹配 fallback（无 BENCHMARK_JOB_NAME 的场景，如 sglang Volcano）：
+    路径 B — token 匹配 fallback（前两路都不适用时）：
       _worker_tokens 存 name/command/env 归一化 token，只计 df==1 的唯一 token
       计分，唯一最高分（>=5）才写入。命中率取决于 token 区分度，并发同类 job 时
       可能匹配失败，保持 unknown（不误配）。
-      当前覆盖范围：github-action 来源的 job pod；atomgit-action 多机场景未见于
-      生产，若出现也会走此路径，但 atomgit job pod 名不含 -workflow，需届时验证。
+
+    路径 A1/A2 精确命中多个时（同 config 窗口内重复跑），取 worker 之前最近创建的
+    那个（_latest_preceding），而不是直接放弃；创建时间并列才保持 unknown。
     """
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             # 取所有待关联的 worker pod（有 _worker_kind，comments 为空）
             cur.execute(
-                "SELECT env_id, name, created_at, _worker_tokens FROM pod_history "
+                "SELECT env_id, name, created_at, _worker_tokens, _worker_run_id FROM pod_history "
                 "WHERE cluster = %s AND _worker_kind <> '' "
                 "AND COALESCE(extend_env_comments, '{}') IN ('{}', '') "
                 "AND created_at <> ''",
@@ -1321,31 +1367,35 @@ def _sync_worker_pods():
             df[t] = df.get(t, 0) + 1
 
     updates = []
-    for env_id, worker_name, created_at, worker_tokens in workers:
+    for env_id, worker_name, created_at, worker_tokens, worker_run_id in workers:
         w_created = parse_iso(str(created_at)) if created_at else None
         best = None
 
-        # 路径 A：BENCHMARK_JOB_NAME 精确匹配
-        if worker_tokens:
-            bench_matched = []
-            for j in jobs:
-                if not j["matrix_name"]:
-                    continue
-                if not _bench_matches(worker_tokens, j.get("branch", ""), j["matrix_name"]):
-                    continue
-                if j["created"] and w_created:
-                    if j["created"] > w_created + timedelta(minutes=5):
-                        continue
-                    if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
-                        continue
-                if j["expires"] and w_created and j["expires"] < w_created:
-                    continue
-                bench_matched.append(j)
-            if len(bench_matched) == 1:
-                best = bench_matched[0]
+        # 路径 A1：run-id label == job.workflow_run_id（sglang 多机）
+        if worker_run_id:
+            rid = str(worker_run_id)
+            cands = [
+                j for j in jobs
+                if str(j["comments"].get("workflow_run_id", "")) == rid
+                and _in_worker_window(j, w_created)
+            ]
+            best = _latest_preceding(cands)
+            if best:
+                log.info(f"[多机关联/run-id] {worker_name} -> {best['comments'].get('job_display_name', best['env_id'])} (run={rid})")
+
+        # 路径 A2：BENCHMARK_JOB_NAME 精确匹配（vllm-ascend LWS）
+        if best is None and worker_tokens:
+            cands = [
+                j for j in jobs
+                if j["matrix_name"]
+                and _bench_matches(worker_tokens, j.get("branch", ""), j["matrix_name"])
+                and _in_worker_window(j, w_created)
+            ]
+            best = _latest_preceding(cands)
+            if best:
                 log.info(f"[多机关联/bench] {worker_name} -> {best['comments'].get('job_display_name', best['env_id'])}")
 
-        # 路径 B：token fallback（bench 无匹配时）
+        # 路径 B：token fallback
         if best is None:
             wtoks = set((worker_tokens or "").split()) if worker_tokens else set()
             if not wtoks and worker_tokens:

@@ -8,11 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 
 ### Added
 - 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后在 DB 中关联到同 cluster 有工作流信息的 job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/业务代码
-  - **路径 A — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，用 job 的 `job_display_name` 括号内 `(branch, matrix_name)` 重建 `"{branch}-{matrix_name}"` 精确比较（vllm-ascend 专用格式）；兼容任意分支名（含 `-`），且避免"某个 matrix 是另一个后缀"的碰撞；实测 gy-005 集群 4/4 命中，零误配
-  - **路径 B — token 匹配 fallback**（sglang Volcano 等无 BENCHMARK_JOB_NAME 场景）：从 pod name/command/env 提取归一化 token，只计在候选 job 中唯一出现（df==1）的 token 计分，唯一最高分（≥5）才写入
-  - 时间窗口：job 先于 worker 创建（5min 余量），差值不超过 24h；两路均保守，无唯一匹配时保持 `unknown`
+  - **路径 A1 — run-id label 精确匹配**（sglang 多机 Volcano）：worker pod 带 `run-id` label（= `github.run_id`，sglang 模板 `k8s_multi_pd_*.yaml.jinja2` 注入），与 job 的 `extend_env_comments.workflow_run_id` 精确相等即命中，确定性最高
+  - **路径 A2 — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，用 job 的 `job_display_name` 括号内 `(branch, matrix_name)` 重建 `"{branch}-{matrix_name}"` 精确比较（vllm-ascend 专用格式）；兼容任意分支名（含 `-`），且避免"某个 matrix 是另一个后缀"的碰撞；实测 gy-005 集群 4/4 命中，零误配
+  - **路径 B — token 匹配 fallback**（前两路不适用时）：从 pod name/command/env 提取归一化 token，只计在候选 job 中唯一出现（df==1）的 token 计分，唯一最高分（≥5）才写入
+  - 路径 A1/A2 精确命中多个时（同一 config 在窗口内重复跑），取 worker 之前最近创建的 job（latest-preceding），而非直接放弃；创建时间并列才保持 `unknown`
+  - 时间窗口：job 先于 worker 创建（5min 余量），差值不超过 24h
+  - 启动时 `_initial_scan` 对存量运行中的 worker pod 重新提取一次，回填 `_worker_kind`/`_worker_tokens`/`_worker_run_id`，使部署前已存在的 worker 也能被关联
   - **当前覆盖范围**：github-action 来源的 job pod（vllm-ascend / sglang）；atomgit-action 多机场景生产暂未出现，若出现走路径 B，届时需验证
-- 新增内部列 `_worker_kind`（`lws` / `volcano`）与 `_worker_tokens`（LWS 存 `BENCHMARK_JOB_NAME` 原始值；Volcano 等存 token 串），随建表/迁移自动创建，不对外暴露
+- 新增内部列 `_worker_kind`（`lws` / `volcano`）、`_worker_tokens`（LWS 存 `BENCHMARK_JOB_NAME` 原始值；Volcano 等存 token 串）与 `_worker_run_id`（worker pod 的 `run-id` label），随建表/迁移自动创建，不对外暴露
 - 新增 `source` 字段（`github-action` / `atomgit-action` / `unknown`），在写入时由 `_extract_record` 按 label/annotation 判断填充：
   - `github-action`：Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod）
   - `atomgit-action`：Pod 带 `octopus.io/job-run-id` annotation（AtomGit/GitCode CI 拉起）
