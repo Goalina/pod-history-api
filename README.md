@@ -15,6 +15,7 @@ K8s 集群 Pod 历史记录服务，对外提供符合 [resource-deploy-core](ht
 - Pod 进入 Running 时记录创建信息；进入终态（Succeeded / Failed / Unknown）时记录结束信息
 - 运行中的 Pod 状态变更会实时更新（如 Pending → Running）
 - Pod 被删除但未经过正常终止流程时，标记为 `expired`
+- 多机 CI 场景下由 LWS / Volcano Job 等控制器创建的 worker pod，会自动关联到拉起它的 `-workflow` job pod，继承相同的 PR / 工作流信息（`extend_env_comments`）与 `source`；关联依据为 pod 自身的 name/env/command token 与 job 的 `job_display_name` 匹配，并在候选不唯一时保持 `unknown`
 - 默认跳过 `kube-system`、`kube-public`、`kube-node-lease`、`arc-history`、`arc-systems` 中的 Pod
 - 历史记录默认保留 30 天，超期自动清理
 

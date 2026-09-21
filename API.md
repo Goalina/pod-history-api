@@ -291,6 +291,7 @@ start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
 - **触发条件：**
   - `source=github-action`：Pod 名称以 `-workflow` 结尾时，由采集器查询 EphemeralRunner CRD 异步填充
   - `source=atomgit-action`：采集时直接从 `octopus.io/` 前缀 annotation 提取
+  - 多机 CI worker pod（LWS / Volcano Job 等）：由采集器关联到拉起它的 `-workflow` job pod 后，继承该 job 的 `source` 与 `extend_env_comments`（含 PR / workflow_run_id 等信息）
   - 其余情况为空对象 `{}`
 - **子字段（`source=github-action`）：**
 
@@ -420,6 +421,8 @@ function buildGithubUrls(comments) {
 | `unknown` | 以上均不匹配 | 来源无法识别 |
 
 > `atomgit-action` 类型的 Pod，其 `extend_env_comments` 直接从 `octopus.io/` 前缀 annotation 提取（见下方 `extend_env_comments` 的 AtomGit 字段）。
+>
+> 多机 CI 的 worker pod（LWS、Volcano Job 等，本身不带 CI label/annotation）会由采集器关联到其来源 job pod，`source` 随之继承为 `github-action` / `atomgit-action`；关联不唯一时保持 `unknown`。
 
 ---
 

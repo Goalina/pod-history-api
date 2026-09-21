@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
+- 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后关联到同期存活的 `-workflow` job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/workflow 代码
+  - 匹配依据全部来自 pod 自身：worker 的 name/env/command 归一化 token 与 job 的 `job_display_name` 求交，只计在候选 job 中唯一出现（df==1）的 token；再叠加时间窗口（job 先于 worker 创建、不早于 worker 结束、且不超过 24h）
+  - 仅当最高分唯一且达到阈值才写入，否则保持 `unknown`，不硬猜；同一 config 并发多 job 时会因最高分不唯一而跳过
+- 新增内部列 `_worker_kind`（`lws` / `volcano`）与 `_worker_tokens`，随建表/迁移自动创建，不对外暴露
 - 新增 `source` 字段（`github-action` / `atomgit-action` / `unknown`），在写入时由 `_extract_record` 按 label/annotation 判断填充：
   - `github-action`：Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod）
   - `atomgit-action`：Pod 带 `octopus.io/job-run-id` annotation（AtomGit/GitCode CI 拉起）
@@ -16,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 - `/atomgit` 路由支持分页：`limit`（默认 1000，范围 1~5000）+ `offset`（默认 0），响应新增 `total`（满足条件的总条数）、`limit`、`offset` 字段。主路由不分页，行为保持不变
 
 ### Changed
+- upsert 的 `source` 更新改为：新值为 `unknown` 且旧值非 `unknown` 时保留旧值。避免多机 worker pod 被关联后，进入终态被 watcher 重新提取（`source=unknown`）时把已继承的 `source` 冲掉
 - `source` 列已加入 DB schema（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），存量记录默认值为 `unknown`，服务启动时自动迁移，无需手动执行 SQL
 - ARC source 判断从依赖 Pod 名字后缀改为依赖可靠的 label（`actions-ephemeral-runner`、`runner-pod`）
 - `_build_query` 拆分为 `_build_where`（只出 WHERE 子句），SELECT/ORDER/LIMIT 由 `query_history` 拼接，以支持分页与 COUNT 复用同一套过滤条件

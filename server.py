@@ -156,6 +156,8 @@ _CREATE_TABLE_SQL = """
         _node TEXT DEFAULT '',
         _image TEXT DEFAULT '',
         _exit_code INTEGER,
+        _worker_kind TEXT DEFAULT '',
+        _worker_tokens TEXT DEFAULT '',
         _updated_at TEXT NOT NULL
     )
 """
@@ -171,14 +173,18 @@ _CREATE_INDEXES_SQL = [
 _MIGRATE_SQL = [
     # 加列必须在 _CREATE_INDEXES_SQL 之前执行（见 _init_db）；idx_source 由建索引统一负责
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'",
+    # 多机 CI worker pod 识别/关联（LWS、Volcano Job 等）
+    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_kind TEXT DEFAULT ''",
+    "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_tokens TEXT DEFAULT ''",
 ]
 
 _UPSERT_SQL = """
     INSERT INTO pod_history
         (env_id, name, cluster, status, created_at, expires_at, ttl_seconds, duration,
          wait_duration, groups, extend_env_comments, resource_summary,
-         node_ip, npu_list, source, _namespace, _node, _image, _exit_code, _updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         node_ip, npu_list, source, _namespace, _node, _image, _exit_code,
+         _worker_kind, _worker_tokens, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (env_id) DO UPDATE SET
         name = EXCLUDED.name,
         cluster = EXCLUDED.cluster,
@@ -195,11 +201,14 @@ _UPSERT_SQL = """
         resource_summary = EXCLUDED.resource_summary,
         node_ip = EXCLUDED.node_ip,
         npu_list = EXCLUDED.npu_list,
-        source = EXCLUDED.source,
+        source = CASE WHEN EXCLUDED.source = 'unknown' AND pod_history.source <> 'unknown'
+                      THEN pod_history.source ELSE EXCLUDED.source END,
         _namespace = EXCLUDED._namespace,
         _node = EXCLUDED._node,
         _image = EXCLUDED._image,
         _exit_code = EXCLUDED._exit_code,
+        _worker_kind = EXCLUDED._worker_kind,
+        _worker_tokens = EXCLUDED._worker_tokens,
         _updated_at = EXCLUDED._updated_at
 """
 
@@ -349,6 +358,8 @@ def _flush_buffer():
                     r.get("_node", ""),
                     r.get("_image", ""),
                     r.get("_exit_code"),
+                    r.get("_worker_kind", ""),
+                    r.get("_worker_tokens", ""),
                     now_utc().isoformat(),
                 ) for r in records
             ])
@@ -427,6 +438,76 @@ def _parse_npu_list(annotations: dict) -> list:
         if m:
             ids.append(m.group(1))
     return ids
+
+
+# ──────────────────────────────────────────────────────────
+# 多机 CI worker pod 识别（LWS / Volcano Job 等）
+# ──────────────────────────────────────────────────────────
+# 这些 pod 由 K8s 控制器（LeaderWorkerSet / Volcano 等）创建，K8s 不保存
+# 发起创建它们的 CI job pod 身份。这里记录 pod 自身的可辨识信息（kind + tokens），
+# 由 _sync_worker_pods 事后与同期存活的 -workflow job pod 按 token 匹配关联。
+
+_WORKER_TOKEN_MIN_LEN = 4
+_WORKER_TOKEN_CAP     = 4000
+
+# 高频通用词，不参与匹配，避免把任意 job 和 worker 关联上
+_WORKER_STOPWORDS = {
+    "true", "false", "none", "null", "default", "scheduler", "kubernetes",
+    "container", "containers", "value", "valuefrom", "fieldref", "metadata",
+    "path", "config", "test", "tests", "main", "nightly", "multi", "node",
+    "project", "image", "always", "running", "pending", "succeeded", "failed",
+    "unknown", "please", "http", "https", "github", "gitcode", "com", "cn",
+    "swr", "base", "dockerhub", "local", "root", "cache", "data", "workspace",
+    "driver", "tools", "ascend", "sglang", "vllm", "aten", "cann", "yaml",
+    "runner", "build", "ubuntu", "python", "latest", "linux", "aarch64",
+    "amd64", "arm64", "x86", "docker", "mirror", "tuna", "tsinghua", "edu",
+}
+
+_TOKEN_RE = re.compile(r'[a-z0-9]+')
+
+
+def _tokenize(text: str) -> set:
+    """归一化文本为去重 token 集合（小写、去通用词、去纯数字/过短）。"""
+    if not text:
+        return set()
+    toks = set()
+    for t in _TOKEN_RE.findall(text.lower()):
+        if len(t) < _WORKER_TOKEN_MIN_LEN or t.isdigit():
+            continue
+        if t in _WORKER_STOPWORDS:
+            continue
+        toks.add(t)
+    return toks
+
+
+def _worker_kind(pod) -> str:
+    """判断 pod 是否为多机 CI worker pod：lws / volcano。"""
+    labels = pod.metadata.labels or {}
+    if labels.get("leaderworkerset.sigs.k8s.io/name"):
+        return "lws"
+    for ref in (pod.metadata.owner_references or []):
+        if (ref.api_version or "").startswith("batch.volcano.sh"):
+            return "volcano"
+    return ""
+
+
+def _worker_tokens(pod) -> str:
+    """收集 worker pod 自身的可辨识 token（名字/命令/env 值），用于事后关联。
+
+    env 里过长的值（JSON、设备、secret 等）不参与，避免噪声与误匹配。
+    """
+    parts = [pod.metadata.name or ""]
+    spec = pod.spec
+    for c in (spec.containers or []):
+        if c.command:
+            parts.extend(c.command)
+        if c.args:
+            parts.extend(c.args)
+        for e in (c.env or []):
+            v = e.value
+            if v and len(v) <= 200 and not v.startswith(("{", "[")):
+                parts.append(v)
+    return " ".join(sorted(_tokenize(" ".join(parts))))[:_WORKER_TOKEN_CAP]
 
 
 def _extract_record(pod) -> dict | None:
@@ -544,6 +625,9 @@ def _extract_record(pod) -> dict | None:
             except Exception as e:
                 log.debug(f"获取 EphemeralRunner {runner_name} 失败: {e}")
 
+    worker_kind = _worker_kind(pod)
+    worker_tokens = _worker_tokens(pod) if worker_kind else ""
+
     return {
         "env_id":              meta.uid,
         "name":                meta.name,
@@ -564,6 +648,8 @@ def _extract_record(pod) -> dict | None:
         "_node":               (spec.node_name or ""),
         "_image":              (spec.containers[0].image if spec.containers else ""),
         "_exit_code":          _get_exit_code(status) if is_terminal else None,
+        "_worker_kind":        worker_kind,
+        "_worker_tokens":      worker_tokens,
     }
 
 
@@ -1058,6 +1144,140 @@ def _sync_remote_workflow_pods(runner_map: dict):
     _put_conn(conn)
 
 
+_WORKER_MATCH_MIN_SCORE = 5
+_WORKER_MATCH_MAX_AGE   = timedelta(hours=24)
+
+
+def _best_job_for_worker(wtoks: set, w_created: datetime, jobs: list, df: dict):
+    """在候选 job 中为 worker 选唯一最佳匹配，无唯一/未达阈值则返回 None。"""
+    if not wtoks or not w_created:
+        return None
+    scored = []
+    for j in jobs:
+        if j["created"]:
+            if j["created"] > w_created + timedelta(minutes=5):
+                continue
+            if w_created - j["created"] > _WORKER_MATCH_MAX_AGE:
+                continue
+        if j["expires"] and j["expires"] < w_created:
+            continue
+        score = sum(len(t) for t in (wtoks & j["tokens"]) if df.get(t, 0) == 1)
+        if score:
+            scored.append((score, j))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None  # 最高分不唯一，保持 unknown 不硬猜
+    score, best = scored[0]
+    if score < _WORKER_MATCH_MIN_SCORE:
+        return None
+    return score, best
+
+
+def _sync_worker_pods():
+    """把多机 CI worker pod（LWS / Volcano Job 等）关联到拉起它的 -workflow job pod。
+
+    关联依据全部来自 pod 自身，不依赖仓库/CI 配置：
+      - token 命中：worker 的 _worker_tokens 与 job 的 job_display_name 归一化 token 求交，
+        只计“在候选 job 中唯一出现”的 token（df==1），避免 repo/路径等通用词误配。
+      - 时间窗口：job 在 worker 创建之前（留 5min 余量）、未早于 worker 结束、且不超过 24h。
+    只有唯一最高分（且达到阈值）才写入，否则保持 unknown。
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT env_id, name, created_at, _worker_tokens FROM pod_history "
+                "WHERE cluster = %s AND _worker_kind <> '' "
+                "AND COALESCE(extend_env_comments, '{}') IN ('{}', '') "
+                "AND created_at <> ''",
+                (CLUSTER_ID,),
+            )
+            workers = cur.fetchall()
+            cur.execute(
+                "SELECT env_id, name, created_at, expires_at, source, extend_env_comments "
+                "FROM pod_history "
+                "WHERE cluster = %s AND source IN ('github-action', 'atomgit-action') "
+                "AND name LIKE '%%-workflow' "
+                "AND COALESCE(extend_env_comments, '{}') NOT IN ('{}', '')",
+                (CLUSTER_ID,),
+            )
+            job_rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
+        _put_conn(conn)
+
+    if not workers:
+        return
+
+    jobs = []
+    for env_id, _name, created, expires, source, comments_json in job_rows:
+        try:
+            comments = json.loads(comments_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            comments = {}
+        toks = _tokenize(comments.get("job_display_name") or comments.get("workflow_ref", ""))
+        if not toks:
+            continue
+        jobs.append({
+            "env_id":   env_id,
+            "created":  parse_iso(str(created)) if created else None,
+            "expires":  parse_iso(str(expires)) if expires else None,
+            "source":   source,
+            "comments": comments,
+            "tokens":   toks,
+        })
+    if not jobs:
+        return
+
+    # df[token] = 该 token 在候选 job 中出现的次数，仅 df==1 的命中计入分数
+    df = {}
+    for j in jobs:
+        for t in j["tokens"]:
+            df[t] = df.get(t, 0) + 1
+
+    updates = []
+    for env_id, worker_name, created_at, tokens in workers:
+        wtoks = set((tokens or "").split())
+        w_created = parse_iso(str(created_at)) if created_at else None
+        matched = _best_job_for_worker(wtoks, w_created, jobs, df)
+        if not matched:
+            continue
+        score, best = matched
+        updates.append((
+            best["source"],
+            json.dumps(best["comments"], ensure_ascii=False),
+            now_utc().isoformat(),
+            env_id,
+        ))
+        log.info(
+            f"[多机关联] {worker_name} → "
+            f"{best['comments'].get('job_display_name') or best['env_id']} (score={score})"
+        )
+
+    if not updates:
+        return
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE pod_history SET source = %s, extend_env_comments = %s, _updated_at = %s "
+                "WHERE env_id = %s AND COALESCE(extend_env_comments, '{}') IN ('{}', '')",
+                updates,
+            )
+        conn.commit()
+        log.info(f"[多机关联] 更新 {len(updates)} 条 worker pod 的 CI 信息")
+    except Exception as e:
+        log.warning(f"[多机关联] 更新失败: {e}")
+        _put_conn(conn, error=True)
+        return
+    _put_conn(conn)
+
+
 def _runner_sync_loop():
     while True:
         time.sleep(RUNNER_SYNC_INTERVAL)
@@ -1065,6 +1285,10 @@ def _runner_sync_loop():
             _sync_ephemeral_runners()
         except Exception as e:
             log.error(f"EphemeralRunner 同步失败: {e}")
+        try:
+            _sync_worker_pods()
+        except Exception as e:
+            log.error(f"多机 worker 关联失败: {e}")
 
 
 # ──────────────────────────────────────────────────────────
