@@ -1286,8 +1286,7 @@ def _sync_worker_pods():
 
     路径 A1 — run-id label 精确匹配（sglang 多机 Volcano）：
       worker pod 带 label run-id（= github.run_id，sglang 模板注入），与 job pod 的
-      extend_env_comments.workflow_run_id 精确相等即命中。确定性最高；run-id 每次
-      运行唯一，故 Pending（created_at 为空）的 worker 也能关联。
+      extend_env_comments.workflow_run_id 精确相等即命中。确定性最高。
 
     路径 A2 — BENCHMARK_JOB_NAME 精确匹配（vllm-ascend LWS）：
       _worker_tokens 存 BENCHMARK_JOB_NAME 原始值，用 job_display_name 括号内的
@@ -1310,7 +1309,8 @@ def _sync_worker_pods():
             cur.execute(
                 "SELECT env_id, name, created_at, _worker_tokens, _worker_run_id FROM pod_history "
                 "WHERE cluster = %s AND _worker_kind <> '' "
-                "AND COALESCE(extend_env_comments, '{}') IN ('{}', '')",
+                "AND COALESCE(extend_env_comments, '{}') IN ('{}', '') "
+                "AND created_at <> ''",
                 (CLUSTER_ID,),
             )
             workers = cur.fetchall()
@@ -1372,14 +1372,12 @@ def _sync_worker_pods():
         best = None
 
         # 路径 A1：run-id label == job.workflow_run_id（sglang 多机）
-        # run-id 每次运行全局唯一，故即使 worker 仍在 Pending（created_at 为空、
-        # 无 startTime）也能精确关联；有时间时再叠加时间窗口。
         if worker_run_id:
             rid = str(worker_run_id)
             cands = [
                 j for j in jobs
                 if str(j["comments"].get("workflow_run_id", "")) == rid
-                and (not w_created or _in_worker_window(j, w_created))
+                and _in_worker_window(j, w_created)
             ]
             best = _latest_preceding(cands)
             if best:

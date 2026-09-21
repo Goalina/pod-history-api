@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 
 ### Added
 - 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后在 DB 中关联到同 cluster 有工作流信息的 job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/业务代码
-  - **路径 A1 — run-id label 精确匹配**（sglang 多机 Volcano）：worker pod 带 `run-id` label（= `github.run_id`，sglang 模板 `k8s_multi_pd_*.yaml.jinja2` 注入），与 job 的 `extend_env_comments.workflow_run_id` 精确相等即命中，确定性最高；run-id 每次运行唯一，故仍处于 Pending（`created_at` 为空）的 worker 也能关联
+  - **路径 A1 — run-id label 精确匹配**（sglang 多机 Volcano）：worker pod 带 `run-id` label（= `github.run_id`，sglang 模板 `k8s_multi_pd_*.yaml.jinja2` 注入），与 job 的 `extend_env_comments.workflow_run_id` 精确相等即命中，确定性最高
   - **路径 A2 — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，用 job 的 `job_display_name` 括号内 `(branch, matrix_name)` 重建 `"{branch}-{matrix_name}"` 精确比较（vllm-ascend 专用格式）；兼容任意分支名（含 `-`），且避免"某个 matrix 是另一个后缀"的碰撞；实测 gy-005 集群 4/4 命中，零误配
   - **路径 B — token 匹配 fallback**（前两路不适用时）：从 pod name/command/env 提取归一化 token，只计在候选 job 中唯一出现（df==1）的 token 计分，唯一最高分（≥5）才写入
   - 路径 A1/A2 精确命中多个时（同一 config 在窗口内重复跑），取 worker 之前最近创建的 job（latest-preceding），而非直接放弃；创建时间并列才保持 `unknown`
