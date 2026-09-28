@@ -178,6 +178,9 @@ _INDEXES = [
 # 避免并发 CREATE INDEX 触发死锁 / duplicate key 并留下无效索引。
 _MIGRATION_LOCK_KEY = 0x706F645F68697374  # 任意固定值
 
+# 注意：DDL 在 autocommit 连接上逐条提交（见 _init_db），迁移不是原子的。
+# 所有迁移语句必须幂等（目前均为 ADD COLUMN IF NOT EXISTS），中途崩溃下次重跑从头执行；
+# 若未来新增非幂等迁移（如数据回填 UPDATE），需自行保证可重入。
 _MIGRATE_SQL = [
     # 加列必须在 _ensure_indexes 之前执行（见 _init_db）；索引由 _ensure_indexes 统一负责
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'",
@@ -186,6 +189,15 @@ _MIGRATE_SQL = [
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_tokens TEXT DEFAULT ''",
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_run_id TEXT DEFAULT ''",
 ]
+
+# 拿不到迁移锁时用它校验 schema 是否已由其它副本迁移完成，避免带缺列对外服务
+_REQUIRED_COLUMNS = {
+    "env_id", "name", "cluster", "status", "created_at", "expires_at",
+    "ttl_seconds", "duration", "wait_duration", "groups", "extend_env_comments",
+    "resource_summary", "node_ip", "npu_list", "source", "_namespace", "_node",
+    "_image", "_exit_code", "_worker_kind", "_worker_tokens", "_worker_run_id",
+    "_updated_at",
+}
 
 _UPSERT_SQL = """
     INSERT INTO pod_history
@@ -299,6 +311,16 @@ def _acquire_migration_lock(mig, timeout_s: int = 600) -> bool:
     return True
 
 
+def _schema_ready(cur) -> bool:
+    """pod_history 是否已具备所有必需列（用于拿不到迁移锁时的完整性校验）。"""
+    cur.execute(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = 'pod_history' AND column_name = ANY(%s)",
+        (list(_REQUIRED_COLUMNS),),
+    )
+    return cur.fetchone()[0] == len(_REQUIRED_COLUMNS)
+
+
 def _init_db():
     global _pool
     if not DATABASE_URL:
@@ -312,9 +334,14 @@ def _init_db():
     mig.autocommit = True
     try:
         if not _acquire_migration_lock(mig):
-            # 超时说明另一个副本长时间持有迁移锁；本副本不执行 DDL 直接启动，
-            # 由持锁副本完成迁移（索引缺失只影响性能，列迁移正常已由持锁方完成）。
-            log.error("获取迁移锁超时，跳过本次 schema 迁移")
+            # 超时说明另一个副本长时间持有迁移锁（通常在建索引，列迁移早已完成）。
+            # 不能盲目跳过：先校验列是否齐全，缺列则快速失败让 K8s 重启重试，
+            # 避免带着缺列的 schema 对外服务。
+            with mig.cursor() as cur:
+                ready = _schema_ready(cur)
+            if not ready:
+                raise RuntimeError("获取迁移锁超时且 schema 不完整，重启重试")
+            log.warning("获取迁移锁超时，schema 已就绪，跳过本次迁移（索引由其它副本构建）")
         else:
             try:
                 # 表结构 / 加列：失败致命（查询依赖这些列）

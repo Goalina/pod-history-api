@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
   - 索引统一由 `_ensure_indexes` 以 `CREATE INDEX CONCURRENTLY` 构建（索引定义收敛为 `_INDEXES` 列表），建索引期间不阻塞读写；索引失败仅告警、不影响服务启动（表结构/加列失败仍致命）
   - 多副本并发启动用 `pg_try_advisory_lock` 轮询串行化迁移：阻塞式 `pg_advisory_lock` 的等待事务会持有快照，与持锁进程的 `CREATE INDEX CONCURRENTLY` 互相等待形成死锁（实测可复现）
   - 检测 `indisvalid=false` 的无效索引（并发构建失败遗留、`IF NOT EXISTS` 永不重建）并自动 `DROP INDEX CONCURRENTLY` 后重建
+  - 拿不到迁移锁时校验 `pod_history` 必需列是否齐全：缺列则快速失败重启重试，避免带缺列对外服务；迁移在 autocommit 下逐条提交、非原子，要求所有迁移语句幂等
 
 ### Fixed
 - 补充 `idx_expires_at` 索引：`match_mode=released` 按 `expires_at` 范围过滤，但 `_CREATE_INDEXES_SQL` 只有 `status`/`created_at`/`cluster`/`name`/`source`，缺 `expires_at` 索引，导致全表 Seq Scan；默认 `created` 路径命中 `idx_created_at`，故去掉 `match_mode` 反而更快。50 万行实测：`released` 53.6ms（Parallel Seq Scan）→ 0.118ms（`Index Scan using idx_expires_at`），与 `created` 对齐
