@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 - `/atomgit` 路由支持分页：`limit`（默认 1000，范围 1~5000）+ `offset`（默认 0），响应新增 `total`（满足条件的总条数）、`limit`、`offset` 字段。主路由不分页，行为保持不变
 
 ### Changed
+- 集群卡数采集改用原始 JSON（`_preload_content=False` + `json.loads`），跳过 kubernetes 客户端逐对象模型反序列化：实测 741 Pod / 8.1MB 的 `list_pod_for_all_namespaces` 从 **~30s（默认反序列化）降到 ~10s**，整轮采集（含 `list_node`）从 30s+ 降到 ~8s，显著减少 CPU 占用与对同进程 watcher/flush 的 GIL 挤压
 - upsert 的 `source` 更新改为：新值为 `unknown` 且旧值非 `unknown` 时保留旧值。避免多机 worker pod 被关联后，进入终态被 watcher 重新提取（`source=unknown`）时把已继承的 `source` 冲掉
 - `source` 列已加入 DB schema（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），存量记录默认值为 `unknown`，服务启动时自动迁移，无需手动执行 SQL
 - ARC source 判断从依赖 Pod 名字后缀改为依赖可靠的 label（`actions-ephemeral-runner`、`runner-pod`）
