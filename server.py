@@ -39,9 +39,9 @@ MODE            = os.environ.get("MODE", "standalone")
 
 RUNNER_SYNC_INTERVAL = int(os.environ.get("RUNNER_SYNC_INTERVAL", "30"))
 
-# 集群卡数快照：采集间隔与对齐粒度（秒），默认 5 分钟
+# 集群卡数快照：采集/对齐粒度（秒），默认 5 分钟；snapshot_time 对齐到其整数倍
 CAPACITY_INTERVAL = int(os.environ.get("CAPACITY_INTERVAL", "300"))
-_CAPACITY_BUCKET  = 300
+_CAPACITY_BUCKET  = CAPACITY_INTERVAL
 
 SKIP_NS = {
     "kube-system", "kube-public", "kube-node-lease",
@@ -1294,13 +1294,22 @@ def _collect_capacity():
         log.error(f"[容量] {CLUSTER_ID or 'local'} 采集失败: {e}")
 
 
+def _next_capacity_sleep(now: float) -> float:
+    """距离下一个整 _CAPACITY_BUCKET 边界的秒数（至少 1s）。"""
+    next_ts = (int(now // _CAPACITY_BUCKET) + 1) * _CAPACITY_BUCKET
+    return max(1.0, next_ts - now)
+
+
 def _capacity_loop():
     while True:
         try:
             _collect_capacity()
         except Exception as e:
             log.error(f"[容量] 循环异常: {e}")
-        time.sleep(CAPACITY_INTERVAL)
+        # 睡到下一个整 bucket 边界，而非固定 sleep(CAPACITY_INTERVAL)：
+        # 采集本身耗时（list nodes + list pods）会叠加到周期上导致相位漂移，
+        # 累积后周期性跳过整个 bucket（实测 gy-001/hk-001 丢过 09:00 桶）。
+        time.sleep(_next_capacity_sleep(time.time()))
 
 
 def _er_to_info(er) -> dict:
