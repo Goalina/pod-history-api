@@ -1,5 +1,79 @@
 # API 接口文档
 
+## 路由总览
+
+系统提供两个查询路由，返回的**单条记录结构完全一致**（见下方「响应字段说明」），区别只在于「查哪些 Pod」和「是否分页」。
+
+| 路由 | 查询范围 | 分页 | 适用场景 |
+|---|---|---|---|
+| `GET /api/v1/envs/history` | **全部来源**的 Pod（`github-action` / `atomgit-action` / `unknown`） | ❌ 一次性全量返回 | 跨来源统计、NPU 占用汇总、兼容历史调用方 |
+| `GET /api/v1/envs/history/atomgit` | **仅 AtomGit CI**（`source=atomgit-action`）拉起的 Pod | ✅ `limit`/`offset` 分页 | 只关心 AtomGit CI 任务、数据量大需翻页 |
+
+两个路由共享同一套过滤参数（`start_time` / `end_time` / `match_mode` / `status` / `name_prefix` / `cluster`），下方「请求参数」章节通用。差异仅两点：
+
+1. `/atomgit` 在过滤条件上**额外固定** `source = atomgit-action`，调用方无需也无法传 `source`。
+2. `/atomgit` **支持分页**且响应多出 `total` / `limit` / `offset` 三个字段；主路由不分页、响应只有 `count` / `envs`。
+
+### 两个路由的输入输出对照
+
+| | `GET /api/v1/envs/history` | `GET /api/v1/envs/history/atomgit` |
+|---|---|---|
+| **必填输入** | `start_time`、`end_time` | 同左 |
+| **可选输入** | `match_mode`、`status`、`name_prefix`、`cluster` | 同左，外加 `limit`、`offset` |
+| **返回范围** | 全部来源 | 仅 `atomgit-action` |
+| **是否分页** | 否，返回时间窗口内全部记录 | 是，默认每页 1000 条 |
+| **输出顶层字段** | `count`、`envs` | `count`、`total`、`limit`、`offset`、`envs` |
+| **单条记录结构** | 完全一致（含 `source` 字段） | 完全一致 |
+
+### `/atomgit` 分页参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `limit` | integer | `1000` | 每页返回条数，取值范围 `1 ~ 5000`，越界返回 400 |
+| `offset` | integer | `0` | 跳过的记录数，不能为负，用于翻页（第 N 页 offset = (N-1) × limit） |
+
+分页响应在 `count` / `envs` 基础上新增：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `total` | integer | 满足过滤条件的**总条数**（不受分页影响），用于计算总页数 |
+| `limit` | integer | 本次生效的每页条数 |
+| `offset` | integer | 本次生效的偏移量 |
+
+```json
+{
+  "count": 1000,
+  "total": 9322,
+  "limit": 1000,
+  "offset": 0,
+  "envs": [ /* ... 单条结构与主路由一致 ... */ ]
+}
+```
+
+> `count` 是本页实际返回条数，`total` 是全部条数。当 `offset + count >= total` 时说明已到最后一页。
+
+### 快速用法示例
+
+```bash
+# 主路由：查某时间段全部来源的 Pod（一次性返回，注意大窗口数据量）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z"
+
+# atomgit 路由：查 AtomGit CI 的 Pod，第 1 页（默认每页 1000）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z"
+
+# atomgit 路由：翻页，每页 100 条取第 3 页（offset = 2 × 100）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&limit=100&offset=200"
+
+# atomgit 路由：结合 cluster 过滤缩小范围
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit?\
+start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
+```
+
+---
+
 ## `GET /api/v1/envs/history`
 
 查询 Pod 历史记录，符合 resource-deploy-core 3.8.1 规范。
@@ -213,9 +287,13 @@
 #### `envs[].extend_env_comments`
 
 - **类型：** object
-- **说明：** 扩展元信息。当前用于关联 **GitHub Actions** 工作流数据
-- **触发条件：** 仅 Pod 名称以 `-workflow` 结尾时自动填充，其余 Pod 为空对象 `{}`
-- **子字段：**
+- **说明：** 扩展元信息，用于关联 CI 工作流数据。字段结构取决于 `source`
+- **触发条件：**
+  - `source=github-action`：Pod 名称以 `-workflow` 结尾时，由采集器查询 EphemeralRunner CRD 异步填充
+  - `source=atomgit-action`：采集时直接从 `octopus.io/` 前缀 annotation 提取
+  - 多机 CI worker pod（LWS / Volcano Job 等）：由采集器关联到拉起它的 `-workflow` job pod 后，继承该 job 的 `source` 与 `extend_env_comments`（含 PR / workflow_run_id 等信息）
+  - 其余情况为空对象 `{}`
+- **子字段（`source=github-action`）：**
 
 | 字段 | 类型 | 示例 | 说明 |
 |---|---|---|---|
@@ -227,6 +305,20 @@
 | `runner_id` | string | `99` | GitHub Runner ID |
 | `organization` | string | `my-org` | 所属 GitHub 组织 |
 | `repository` | string | `my-org/my-repo` | 所属 GitHub 仓库（含组织前缀） |
+
+- **子字段（`source=atomgit-action`）：** 取自 Pod 的 `octopus.io/` 前缀 annotation，共 9 个字段
+
+| 字段 | 类型 | 示例 | 来源 annotation |
+|---|---|---|---|
+| `repository` | string | `Ascend/MindSpeed-MM` | `octopus.io/pc-repository` |
+| `organization` | string | `Ascend` | `octopus.io/pc-repository-owner` |
+| `repository_url` | string | `https://gitcode.com/Ascend/MindSpeed-MM.git` | `octopus.io/pc-repository-url` |
+| `workflow_ref` | string | `Ascend/MindSpeed-MM/.gitcode/workflows/ci.yml@refs/heads/master` | `octopus.io/pc-workflow-ref` |
+| `pipeline_id` | string | `eb80ae42a2fe4d4faa299a7b6f890443` | `octopus.io/pc-pipeline-id` |
+| `pipeline_run_id` | string | `0b5e335e0fca46a6ba3a5691941a0283` | `octopus.io/pc-pipeline-run-id` |
+| `job_display_name` | string | `UT-pool` | `octopus.io/job-name` |
+| `job_external_id` | string | `478fde37728142028a315aadb30fc4a5` | `octopus.io/job-external-id` |
+| `project_id` | string | `bf93426ae91d46a5b21f59aa60d83c3e` | `octopus.io/project-id` |
 
 > 仅非空字段会出现，不同 Pod 返回的字段子集可能不同。
 
@@ -316,6 +408,24 @@ function buildGithubUrls(comments) {
 
 ---
 
+#### `envs[].source`
+
+- **类型：** string
+- **取值：** `github-action` | `atomgit-action` | `unknown`
+- **说明：** Pod 的来源类型，采集时按 label/annotation 判断，不依赖 Pod 名字
+
+| 值 | 判断依据 | 含义 |
+|---|---|---|
+| `github-action` | Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod） | GitHub Actions ARC 拉起 |
+| `atomgit-action` | Pod 带 `octopus.io/job-run-id` annotation | AtomGit CI 拉起 |
+| `unknown` | 以上均不匹配 | 来源无法识别 |
+
+> `atomgit-action` 类型的 Pod，其 `extend_env_comments` 直接从 `octopus.io/` 前缀 annotation 提取（见下方 `extend_env_comments` 的 AtomGit 字段）。
+>
+> 多机 CI 的 worker pod（LWS、Volcano Job 等，本身不带 CI label/annotation）会由采集器关联到其来源 job pod，`source` 随之继承为 `github-action` / `atomgit-action`；关联不唯一时保持 `unknown`。
+
+---
+
 ### 常见查询示例
 
 服务域名：`pod-history-api.test.osinfra.cn`
@@ -336,4 +446,28 @@ start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&cluster=gy006"
 # 按 Pod 名称前缀过滤
 curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&name_prefix=my-job-"
+```
+
+**AtomGit 路由分页遍历**（根据 `total` 翻完所有页）：
+
+```python
+import requests
+
+BASE = "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/atomgit"
+params = {
+    "start_time": "2026-09-20T00:00:00Z",
+    "end_time":   "2026-09-20T23:59:59Z",
+    "limit": 1000,
+    "offset": 0,
+}
+all_envs = []
+while True:
+    r = requests.get(BASE, params=params).json()
+    all_envs.extend(r["envs"])
+    # 已取到的条数 >= 总数，说明翻完了
+    if params["offset"] + r["count"] >= r["total"]:
+        break
+    params["offset"] += params["limit"]
+
+print(f"共 {len(all_envs)} 条 AtomGit CI 记录")
 ```
