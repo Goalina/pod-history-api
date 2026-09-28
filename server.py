@@ -1315,14 +1315,16 @@ def _next_capacity_sleep(now: float) -> float:
 
 def _capacity_loop():
     while True:
+        # 先睡到下一个整 bucket 边界再采集，保证 snapshot_time 与采集时刻一致，
+        # 且从第一个桶起就连续：
+        #  - 若采集后再 sleep(CAPACITY_INTERVAL)，采集耗时（list nodes+pods，实测
+        #    数秒~数十秒）会叠加到周期上，相位逐轮漂移、周期性跳过整个 bucket；
+        #  - 若启动后立即采集，首轮相位随机，会产生错标/跳桶（实测 hk-001 丢过桶）。
+        time.sleep(_next_capacity_sleep(time.time()))
         try:
             _collect_capacity()
         except Exception as e:
             log.error(f"[容量] 循环异常: {e}")
-        # 睡到下一个整 bucket 边界，而非固定 sleep(CAPACITY_INTERVAL)：
-        # 采集本身耗时（list nodes + list pods）会叠加到周期上导致相位漂移，
-        # 累积后周期性跳过整个 bucket（实测 gy-001/hk-001 丢过 09:00 桶）。
-        time.sleep(_next_capacity_sleep(time.time()))
 
 
 def _er_to_info(er) -> dict:
