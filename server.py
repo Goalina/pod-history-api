@@ -1186,12 +1186,22 @@ def _cleanup_loop():
 # 集群卡数快照（collector / standalone 模式）
 # ──────────────────────────────────────────────────────────
 
-def _node_internal_ip(node) -> str:
-    """取节点 InternalIP；无则回退到节点名。"""
-    for addr in (node.status.addresses or []):
-        if addr.type == "InternalIP" and addr.address:
-            return addr.address
-    return node.metadata.name or ""
+def _list_items_raw(api_call, **kwargs) -> list:
+    """以原始 JSON 取列表，跳过 kubernetes 客户端逐对象反序列化。
+
+    后者对上千对象的列表极慢（实测 741 个 Pod、8MB：默认反序列化 30s，
+    原始 JSON 仅 ~10s），且纯 CPU 占用 GIL，会拖慢同进程 watcher/flush。
+    """
+    resp = api_call(_preload_content=False, **kwargs)
+    return json.loads(resp.read()).get("items", []) or []
+
+
+def _node_internal_ip(node: dict) -> str:
+    """从原始节点 dict 取 InternalIP；无则回退到节点名。"""
+    for addr in (((node.get("status") or {}).get("addresses")) or []):
+        if addr.get("type") == "InternalIP" and addr.get("address"):
+            return addr["address"]
+    return (node.get("metadata") or {}).get("name", "")
 
 
 def _capacity_snapshot_time(now: datetime) -> str:
@@ -1219,23 +1229,24 @@ def _write_capacity(snapshot_iso: str, total: int, used: int, node_count: int,
         _put_conn(conn)
 
 
-def _used_cards_by_node() -> dict:
+def _used_cards_by_node(pod_items: list) -> dict:
     """按 (node_name, resource_key) 汇总未终止 Pod 申请的加速卡数。
 
     以容器 resources.requests 为准（与设备插件 counting 一致），只统计已绑定节点
     (spec.nodeName 非空) 且未进入 Succeeded/Failed 的 Pod；包含所有 namespace。
+    入参为原始 Pod dict 列表（见 _list_items_raw）。
     """
     used = {}
-    pods = _k8s_core.list_pod_for_all_namespaces().items
-    for p in pods:
-        spec = p.spec
-        if not spec or not spec.node_name:
+    for p in pod_items:
+        spec = p.get("spec") or {}
+        node_name = spec.get("nodeName")
+        if not node_name:
             continue
-        phase = (p.status.phase if p.status else "") or ""
+        phase = ((p.get("status") or {}).get("phase")) or ""
         if phase in ("Succeeded", "Failed"):
             continue
-        for c in (spec.containers or []):
-            reqs = (c.resources.requests if c.resources else None) or {}
+        for c in (spec.get("containers") or []):
+            reqs = ((c.get("resources") or {}).get("requests")) or {}
             for key, val in reqs.items():
                 if not _NPU_RE.search(key):
                     continue
@@ -1245,7 +1256,7 @@ def _used_cards_by_node() -> dict:
                     continue
                 if n <= 0:
                     continue
-                k = (spec.node_name, key)
+                k = (node_name, key)
                 used[k] = used.get(k, 0) + n
     return used
 
@@ -1259,14 +1270,16 @@ def _collect_capacity():
     """
     snapshot_iso = _capacity_snapshot_time(now_utc())
     try:
-        nodes = _k8s_core.list_node().items
-        used_map = _used_cards_by_node()
+        node_items = _list_items_raw(_k8s_core.list_node)
+        pod_items  = _list_items_raw(_k8s_core.list_pod_for_all_namespaces)
+        used_map = _used_cards_by_node(pod_items)
         entries = []
-        for n in nodes:
-            labels = n.metadata.labels or {}
-            service_type = labels.get("servertype", "")
+        for n in node_items:
+            meta = n.get("metadata") or {}
+            service_type = (meta.get("labels") or {}).get("servertype", "")
+            node_name = meta.get("name", "")
             node_ip = _node_internal_ip(n)
-            for key, val in (n.status.allocatable or {}).items():
+            for key, val in (((n.get("status") or {}).get("allocatable")) or {}).items():
                 if not _NPU_RE.search(key):
                     continue
                 try:
@@ -1280,7 +1293,7 @@ def _collect_capacity():
                     "resource_name": key,
                     "service_type":  service_type,
                     "cards":         cards,
-                    "used":          used_map.get((n.metadata.name, key), 0),
+                    "used":          used_map.get((node_name, key), 0),
                 })
         entries.sort(key=lambda e: (e["node_ip"], e["resource_name"]))
         total = sum(e["cards"] for e in entries)
