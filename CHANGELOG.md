@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
+- 新增集群卡数快照与查询接口：
+  - collector/standalone 新增 `_capacity_loop` 线程，每 `CAPACITY_INTERVAL`（默认 300s，`snapshot_time` 对齐整 5 分钟）采集本集群各节点加速卡 `allocatable`，写入新表 `cluster_card_snapshot`（**一集群一行**）：`total_cards`、`node_count`、`nodes`（JSON 数组，含 `node_ip`/`resource_name`/`service_type`/`cards`）
+  - `service_type` 取节点 label `servertype`；资源键匹配 `ascend|npu|gpu`，跳过值为 0 的键与无加速卡的节点；`node_ip` 取 `InternalIP`
+  - 采集失败写一条 `status='failed'`（`total_cards=0`、`nodes=[]`、`error` 记原因），如实记录不伪造成 0
+  - 新增接口 `GET /api/v1/clusters/capacity?start_time=..&end_time=..[&cluster=..]`：返回区间内快照，每条含 `node_cards`（`node_ip -> 卡数` 扁平映射，便于快速查看）与 `nodes`（详细字段）
+  - 保留期沿用 30 天（并入现有每日清理）
 - 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后在 DB 中关联到同 cluster 有工作流信息的 job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/业务代码
   - **路径 A1 — run-id label 精确匹配**（sglang 多机 Volcano）：worker pod 带 `run-id` label（= `github.run_id`，sglang 模板 `k8s_multi_pd_*.yaml.jinja2` 注入），与 job 的 `extend_env_comments.workflow_run_id` 精确相等即命中，确定性最高
   - **路径 A2 — BENCHMARK_JOB_NAME 精确匹配**（vllm-ascend LWS）：从 pod env 读 `BENCHMARK_JOB_NAME` 原始值，用 job 的 `job_display_name` 括号内 `(branch, matrix_name)` 重建 `"{branch}-{matrix_name}"` 精确比较（vllm-ascend 专用格式）；兼容任意分支名（含 `-`），且避免"某个 matrix 是另一个后缀"的碰撞；实测 gy-005 集群 4/4 命中，零误配
