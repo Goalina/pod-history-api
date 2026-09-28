@@ -1840,34 +1840,8 @@ def query_history(start_time: datetime, end_time: datetime,
     return records
 
 
-def query_capacity(start_time: datetime, end_time: datetime, cluster_filter: str = None) -> list:
-    """查询集群卡数快照（时间段内，按 snapshot_time 倒序）。
-
-    每条记录含 node_cards（node_ip -> 卡数，便于简单查看）与 nodes（详细字段）。
-    """
-    conditions = ["snapshot_time >= %s", "snapshot_time <= %s"]
-    params = [start_time.isoformat(), end_time.isoformat()]
-    if cluster_filter:
-        conditions.append("cluster = %s")
-        params.append(cluster_filter)
-    sql = (
-        "SELECT cluster, snapshot_time, total_cards, node_count, nodes, status, error "
-        "FROM cluster_card_snapshot WHERE " + " AND ".join(conditions) +
-        " ORDER BY snapshot_time DESC, cluster"
-    )
-
-    conn = _get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        conn.commit()
-    except Exception:
-        _put_conn(conn, error=True)
-        raise
-    else:
-        _put_conn(conn)
-
+def _capacity_rows_to_records(rows) -> list:
+    """DB 行 → 接口记录；由 nodes JSON 额外生成 node_cards 扁平映射。"""
     result = []
     for cluster, snapshot_time, total_cards, node_count, nodes_json, status, error in rows:
         try:
@@ -1892,6 +1866,61 @@ def query_capacity(start_time: datetime, end_time: datetime, cluster_filter: str
             "error":         error,
         })
     return result
+
+
+_CAPACITY_SELECT = (
+    "SELECT cluster, snapshot_time, total_cards, node_count, nodes, status, error "
+    "FROM cluster_card_snapshot "
+)
+
+
+def query_capacity(start_time: datetime, end_time: datetime, cluster_filter: str = None) -> list:
+    """按时间段查询集群卡数快照（snapshot_time 倒序）。"""
+    conditions = ["snapshot_time >= %s", "snapshot_time <= %s"]
+    params = [start_time.isoformat(), end_time.isoformat()]
+    if cluster_filter:
+        conditions.append("cluster = %s")
+        params.append(cluster_filter)
+    sql = _CAPACITY_SELECT + "WHERE " + " AND ".join(conditions) + " ORDER BY snapshot_time DESC, cluster"
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
+        _put_conn(conn)
+    return _capacity_rows_to_records(rows)
+
+
+def query_capacity_latest(cluster_filter: str = None) -> list:
+    """不带时间时：返回每个集群最近一次快照。"""
+    where = "WHERE c.cluster = %s" if cluster_filter else ""
+    params = [cluster_filter] if cluster_filter else []
+    sql = (
+        "SELECT c.cluster, c.snapshot_time, c.total_cards, c.node_count, c.nodes, c.status, c.error "
+        "FROM cluster_card_snapshot c "
+        "JOIN (SELECT cluster, MAX(snapshot_time) AS t "
+        "FROM cluster_card_snapshot GROUP BY cluster) m "
+        "ON c.cluster = m.cluster AND c.snapshot_time = m.t "
+        + where + " ORDER BY c.cluster"
+    )
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
+        _put_conn(conn)
+    return _capacity_rows_to_records(rows)
 
 
 # ──────────────────────────────────────────────────────────
@@ -1932,15 +1961,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/clusters/capacity":
             st_str = params.get("start_time", [None])[0]
             et_str = params.get("end_time",   [None])[0]
+            cluster_filter = params.get("cluster", [None])[0]
+
+            # 不带时间：返回每个集群最近一次记录
+            if not st_str and not et_str:
+                snapshots = query_capacity_latest(cluster_filter)
+                return self._ok({"count": len(snapshots), "snapshots": snapshots})
+
+            # 带时间：两者必须同时提供
             if not st_str or not et_str:
-                return self._err("start_time 和 end_time 为必填参数，格式: 2026-06-10T00:00:00Z")
+                return self._err("start_time 和 end_time 需同时提供，或都不提供以查询各集群最新记录")
             start_time = parse_iso(st_str)
             end_time   = parse_iso(et_str)
             if not start_time or not end_time:
                 return self._err("时间格式不合法，请使用 ISO 8601 格式")
             if start_time > end_time:
                 return self._err("start_time 不能晚于 end_time")
-            cluster_filter = params.get("cluster", [None])[0]
             snapshots = query_capacity(start_time, end_time, cluster_filter)
             return self._ok({"count": len(snapshots), "snapshots": snapshots})
 
