@@ -12,7 +12,7 @@
 两个路由共享同一套过滤参数（`start_time` / `end_time` / `match_mode` / `status` / `name_prefix` / `cluster`），下方「请求参数」章节通用。差异仅两点：
 
 1. `/atomgit` 在过滤条件上**额外固定** `source = atomgit-action`，调用方无需也无法传 `source`。
-2. `/atomgit` **支持分页**且响应多出 `total` / `limit` / `offset` 三个字段；主路由不分页、响应只有 `count` / `envs`。
+2. `/atomgit` **支持分页**且响应多出 `limit` / `offset` 两个字段；主路由不分页、响应只有 `count` / `envs`。
 
 ### 两个路由的输入输出对照
 
@@ -22,7 +22,7 @@
 | **可选输入** | `match_mode`、`status`、`name_prefix`、`cluster` | 同左，外加 `limit`、`offset` |
 | **返回范围** | 全部来源 | 仅 `atomgit-action` |
 | **是否分页** | 否，返回时间窗口内全部记录 | 是，默认每页 1000 条 |
-| **输出顶层字段** | `count`、`envs` | `count`、`total`、`limit`、`offset`、`envs` |
+| **输出顶层字段** | `count`、`envs` | `count`、`limit`、`offset`、`envs` |
 | **单条记录结构** | 完全一致（含 `source` 字段） | 完全一致 |
 
 ### `/atomgit` 分页参数
@@ -36,21 +36,20 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `total` | integer | 满足过滤条件的**总条数**（不受分页影响），用于计算总页数 |
 | `limit` | integer | 本次生效的每页条数 |
 | `offset` | integer | 本次生效的偏移量 |
 
 ```json
 {
   "count": 1000,
-  "total": 9322,
   "limit": 1000,
   "offset": 0,
   "envs": [ /* ... 单条结构与主路由一致 ... */ ]
 }
 ```
 
-> `count` 是本页实际返回条数，`total` 是全部条数。当 `offset + count >= total` 时说明已到最后一页。
+> 不返回 `total`：计算总数需要回表扫描全部命中行，在百万行表上月份区间要十几秒，且与 `limit` 无关（会导致取 1 条和取 1000 条一样慢）。
+> 翻页判断：当本页 `count < limit` 时说明已到最后一页。
 
 ### 快速用法示例
 
@@ -448,7 +447,7 @@ curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history?\
 start_time=2026-08-01T00:00:00Z&end_time=2026-08-27T23:59:59Z&name_prefix=my-job-"
 ```
 
-**AtomGit 路由分页遍历**（根据 `total` 翻完所有页）：
+**AtomGit 路由分页遍历**（本页不足 `limit` 即为最后一页）：
 
 ```python
 import requests
@@ -464,8 +463,7 @@ all_envs = []
 while True:
     r = requests.get(BASE, params=params).json()
     all_envs.extend(r["envs"])
-    # 已取到的条数 >= 总数，说明翻完了
-    if params["offset"] + r["count"] >= r["total"]:
+    if r["count"] < r["limit"]:   # 本页不足一页，翻完
         break
     params["offset"] += params["limit"]
 
