@@ -163,17 +163,23 @@ _CREATE_TABLE_SQL = """
     )
 """
 
-_CREATE_INDEXES_SQL = [
-    "CREATE INDEX IF NOT EXISTS idx_status ON pod_history(status)",
-    "CREATE INDEX IF NOT EXISTS idx_created_at ON pod_history(created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_expires_at ON pod_history(expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_cluster ON pod_history(cluster)",
-    "CREATE INDEX IF NOT EXISTS idx_name ON pod_history(name)",
-    "CREATE INDEX IF NOT EXISTS idx_source ON pod_history(source)",
+# 索引定义：(索引名, 列表达式)。建索引语句由 _ensure_indexes 统一生成并以
+# CREATE INDEX CONCURRENTLY 执行，避免大表建索引时阻塞写入。
+_INDEXES = [
+    ("idx_status",     "status"),
+    ("idx_created_at", "created_at"),
+    ("idx_expires_at", "expires_at"),
+    ("idx_cluster",    "cluster"),
+    ("idx_name",       "name"),
+    ("idx_source",     "source"),
 ]
 
+# 迁移用 session 级 advisory lock：多副本并发启动时只允许一个执行 DDL，
+# 避免并发 CREATE INDEX 触发死锁 / duplicate key 并留下无效索引。
+_MIGRATION_LOCK_KEY = 0x706F645F68697374  # 任意固定值
+
 _MIGRATE_SQL = [
-    # 加列必须在 _CREATE_INDEXES_SQL 之前执行（见 _init_db）；idx_source 由建索引统一负责
+    # 加列必须在 _ensure_indexes 之前执行（见 _init_db）；索引由 _ensure_indexes 统一负责
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'",
     # 多机 CI worker pod 识别/关联（LWS、Volcano Job 等）
     "ALTER TABLE pod_history ADD COLUMN IF NOT EXISTS _worker_kind TEXT DEFAULT ''",
@@ -230,24 +236,102 @@ def _put_conn(conn, error=False):
     _pool.putconn(conn)
 
 
+def _index_state(cur, name: str):
+    """索引状态：True 有效 / False 无效（存在但 indisvalid=false）/ None 不存在。"""
+    cur.execute(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(%s)",
+        (name,),
+    )
+    row = cur.fetchone()
+    return None if row is None else bool(row[0])
+
+
+def _ensure_indexes(cur):
+    """确保所有索引存在且有效。
+
+    以 CREATE INDEX CONCURRENTLY 构建，建索引期间不阻塞读写。失败的并发构建会留下
+    indisvalid=false 的无效索引（planner 不采用，且 IF NOT EXISTS 不会再重建），
+    这里检测到后 DROP 再重建。索引属性能优化项，失败仅告警，不影响服务启动。
+    """
+    for name, column in _INDEXES:
+        ready = False
+        for attempt in (1, 2):
+            try:
+                state = _index_state(cur, name)
+                if state is True:
+                    ready = True
+                    break
+                if state is False:
+                    log.warning(f"索引 {name} 无效（indisvalid=false），删除重建")
+                    cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+                cur.execute(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} "
+                    f"ON pod_history({column})"
+                )
+                if _index_state(cur, name) is True:
+                    ready = True
+                    break
+                log.error(f"索引 {name} 创建后仍无效（第 {attempt} 次）")
+            except Exception as e:
+                log.error(f"索引 {name} 处理失败（第 {attempt} 次）: {e}")
+        if not ready:
+            log.error(f"索引 {name} 未就绪，本次跳过（相关查询可能变慢）")
+
+
+def _try_migration_lock(mig) -> bool:
+    """非阻塞尝试获取迁移 advisory lock，每次尝试都是独立短事务。
+
+    不能用阻塞式 pg_advisory_lock：等待事务会持有快照，而持锁进程的
+    CREATE INDEX CONCURRENTLY 又要等该快照结束，二者互相等待形成死锁。
+    轮询式 try-lock 在两次尝试之间不持有任何事务，避免该死锁。
+    """
+    with mig.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_MIGRATION_LOCK_KEY,))
+        return bool(cur.fetchone()[0])
+
+
+def _acquire_migration_lock(mig, timeout_s: int = 600) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while not _try_migration_lock(mig):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(2)
+    return True
+
+
 def _init_db():
     global _pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL 环境变量未设置")
     _pool = psycopg2.pool.ThreadedConnectionPool(2, 10, dsn=DATABASE_URL)
-    conn = _get_conn()
+
+    # DDL 使用独立的 autocommit 连接：
+    #  1) CREATE INDEX CONCURRENTLY 不能在事务块内执行；
+    #  2) 每条语句独立事务，单条失败不会回滚 / 连累其它语句。
+    mig = psycopg2.connect(DATABASE_URL)
+    mig.autocommit = True
     try:
-        with conn.cursor() as cur:
-            cur.execute(_CREATE_TABLE_SQL)
-            # 迁移必须在建索引之前：存量表 CREATE TABLE IF NOT EXISTS 会跳过，
-            # source 列尚未存在，若先建 idx_source 会因 column 不存在而崩溃。
-            for sql in _MIGRATE_SQL:
-                cur.execute(sql)
-            for idx_sql in _CREATE_INDEXES_SQL:
-                cur.execute(idx_sql)
-        conn.commit()
+        if not _acquire_migration_lock(mig):
+            # 超时说明另一个副本长时间持有迁移锁；本副本不执行 DDL 直接启动，
+            # 由持锁副本完成迁移（索引缺失只影响性能，列迁移正常已由持锁方完成）。
+            log.error("获取迁移锁超时，跳过本次 schema 迁移")
+        else:
+            try:
+                # 表结构 / 加列：失败致命（查询依赖这些列）
+                with mig.cursor() as ddl:
+                    ddl.execute("SET lock_timeout = '15s'")
+                    ddl.execute(_CREATE_TABLE_SQL)
+                    for sql in _MIGRATE_SQL:
+                        ddl.execute(sql)
+                    ddl.execute("SET lock_timeout = 0")
+                # 索引：并发构建 + 无效索引恢复，失败仅告警
+                with mig.cursor() as idx_cur:
+                    _ensure_indexes(idx_cur)
+            finally:
+                with mig.cursor() as unlock:
+                    unlock.execute("SELECT pg_advisory_unlock(%s)", (_MIGRATION_LOCK_KEY,))
     finally:
-        _put_conn(conn)
+        mig.close()
     log.info(f"PostgreSQL 已连接: {DATABASE_URL.split('@')[-1]}")
 
 
