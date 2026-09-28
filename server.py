@@ -1858,7 +1858,10 @@ def query_history(start_time: datetime, end_time: datetime,
     """查询历史记录。
 
     - 不分页（limit is None）：返回 list[dict]，兼容主路由原有行为。
-    - 分页（limit 给定）：返回 (list[dict], total)，total 为满足条件的总条数。
+    - 分页（limit 给定）：SQL 层 LIMIT/OFFSET，返回 list[dict]。
+
+    不计算 total：COUNT(*) 需回表扫描全部命中行，在 120 万行表上月份区间要
+    十几秒，且与 limit 无关，会让 limit=1 和 limit=1000 一样慢。
     """
     if MODE in ("collector", "standalone"):
         try:
@@ -1871,10 +1874,9 @@ def query_history(start_time: datetime, end_time: datetime,
     where, params = _build_where(start_time, end_time, status, match_mode,
                                  name_prefix, cluster_filter, source_filter)
 
-    paginated = limit is not None
     data_sql = f"SELECT * FROM pod_history WHERE {where} ORDER BY created_at DESC"
     data_params = list(params)
-    if paginated:
+    if limit is not None:
         data_sql += " LIMIT %s OFFSET %s"
         data_params.extend([limit, offset])
 
@@ -1884,11 +1886,6 @@ def query_history(start_time: datetime, end_time: datetime,
             cur.execute(data_sql, data_params)
             rows = cur.fetchall()
             col_names = [d[0] for d in cur.description]
-            total = None
-            if paginated:
-                # 分页时额外查总数（走 source/created_at 索引，开销远小于取全量行）
-                cur.execute(f"SELECT COUNT(*) FROM pod_history WHERE {where}", params)
-                total = cur.fetchone()[0]
         conn.commit()
     except Exception:
         _put_conn(conn, error=True)
@@ -1896,10 +1893,7 @@ def query_history(start_time: datetime, end_time: datetime,
     else:
         _put_conn(conn)
 
-    records = _rows_to_records(rows, col_names)
-    if paginated:
-        return records, total
-    return records
+    return _rows_to_records(rows, col_names)
 
 
 def _capacity_rows_to_records(rows) -> list:
@@ -2104,14 +2098,12 @@ class Handler(BaseHTTPRequestHandler):
             )
 
             if is_atomgit:
-                envs, total = result
                 clean_envs = [
                     {k: v for k, v in e.items() if not k.startswith("_")}
-                    for e in envs
+                    for e in result
                 ]
                 return self._ok({
                     "count": len(clean_envs),
-                    "total": total,
                     "limit": limit,
                     "offset": offset,
                     "envs": clean_envs,
