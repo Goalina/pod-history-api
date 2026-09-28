@@ -29,10 +29,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 - `source` 列已加入 DB schema（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），存量记录默认值为 `unknown`，服务启动时自动迁移，无需手动执行 SQL
 - ARC source 判断从依赖 Pod 名字后缀改为依赖可靠的 label（`actions-ephemeral-runner`、`runner-pod`）
 - `_build_query` 拆分为 `_build_where`（只出 WHERE 子句），SELECT/ORDER/LIMIT 由 `query_history` 拼接，以支持分页与 COUNT 复用同一套过滤条件
+- `_init_db` 迁移流程加固（免人工预热、多副本并发安全、建索引不停写）：
+  - DDL 改用独立 `autocommit` 连接：`CREATE INDEX CONCURRENTLY` 不能在事务块内执行，且每条语句独立提交、单条失败不连累其它语句（原来所有 DDL 在单事务内，任一句失败会全部回滚并导致进程退出）
+  - 索引统一由 `_ensure_indexes` 以 `CREATE INDEX CONCURRENTLY` 构建（索引定义收敛为 `_INDEXES` 列表），建索引期间不阻塞读写；索引失败仅告警、不影响服务启动（表结构/加列失败仍致命）
+  - 多副本并发启动用 `pg_try_advisory_lock` 轮询串行化迁移：阻塞式 `pg_advisory_lock` 的等待事务会持有快照，与持锁进程的 `CREATE INDEX CONCURRENTLY` 互相等待形成死锁（实测可复现）
+  - 检测 `indisvalid=false` 的无效索引（并发构建失败遗留、`IF NOT EXISTS` 永不重建）并自动 `DROP INDEX CONCURRENTLY` 后重建
+  - 拿不到迁移锁时校验 `pod_history` 必需列是否齐全：缺列则快速失败重启重试，避免带缺列对外服务；迁移在 autocommit 下逐条提交、非原子，要求所有迁移语句幂等
 
 ### Fixed
+- 补充 `idx_expires_at` 索引：`match_mode=released` 按 `expires_at` 范围过滤，但 `_CREATE_INDEXES_SQL` 只有 `status`/`created_at`/`cluster`/`name`/`source`，缺 `expires_at` 索引，导致全表 Seq Scan；默认 `created` 路径命中 `idx_created_at`，故去掉 `match_mode` 反而更快。50 万行实测：`released` 53.6ms（Parallel Seq Scan）→ 0.118ms（`Index Scan using idx_expires_at`），与 `created` 对齐
 - `_init_db` 迁移顺序：`ALTER TABLE ADD COLUMN source` 必须在 `CREATE INDEX idx_source` 之前执行。原顺序在存量表（`CREATE TABLE IF NOT EXISTS` 跳过）上会因 `source` 列不存在导致建索引崩溃、服务无法启动
-- `_MIGRATE_SQL` 中 `source` 默认值 `'plain'` 更正为 `'unknown'`，与建表 SQL 一致；去掉其中重复的 `idx_source` 建索引（统一由 `_CREATE_INDEXES_SQL` 负责）
+- `_MIGRATE_SQL` 中 `source` 默认值 `'plain'` 更正为 `'unknown'`，与建表 SQL 一致；去掉其中重复的 `idx_source` 建索引（统一由 `_ensure_indexes` 负责）
 
 ---
 
