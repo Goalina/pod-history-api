@@ -344,13 +344,21 @@ def _init_db():
             log.warning("获取迁移锁超时，schema 已就绪，跳过本次迁移（索引由其它副本构建）")
         else:
             try:
-                # 表结构 / 加列：失败致命（查询依赖这些列）
-                with mig.cursor() as ddl:
-                    ddl.execute("SET lock_timeout = '15s'")
-                    ddl.execute(_CREATE_TABLE_SQL)
-                    for sql in _MIGRATE_SQL:
-                        ddl.execute(sql)
-                    ddl.execute("SET lock_timeout = 0")
+                # 先校验 schema：列已齐全则完全跳过 DDL。
+                # ADD COLUMN IF NOT EXISTS 即使列已存在，也要先拿 ACCESS EXCLUSIVE 锁，
+                # 在繁忙大表上会导致无谓的锁等待甚至超时失败，故仅缺列时才执行。
+                with mig.cursor() as cur:
+                    schema_complete = _schema_ready(cur)
+                if not schema_complete:
+                    # 表结构 / 加列：失败致命（查询依赖这些列）。此处不设 lock_timeout，
+                    # 与旧行为一致——等待锁而非超时崩溃。
+                    with mig.cursor() as ddl:
+                        ddl.execute(_CREATE_TABLE_SQL)
+                        for sql in _MIGRATE_SQL:
+                            ddl.execute(sql)
+                    with mig.cursor() as cur:
+                        if not _schema_ready(cur):
+                            raise RuntimeError("schema 迁移后仍不完整")
                 # 索引：并发构建 + 无效索引恢复，失败仅告警
                 with mig.cursor() as idx_cur:
                     _ensure_indexes(idx_cur)
