@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 - 抽出 `_er_to_info()` 统一 ER→工作流信息提取逻辑
 
 ### Fixed
+- 补充 `idx_expires_at` 索引：`match_mode=released` 按 `expires_at` 范围过滤此前无索引，走全表 Seq Scan（50 万行实测 48.8ms）；补索引后走 `Index Scan using idx_expires_at`（0.114ms），与默认 `created` 路径（`idx_created_at`，0.057ms）对齐。（大表请先在生产库 `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_expires_at ON pod_history(expires_at);` 预热，`_init_db()` 的普通 `CREATE INDEX IF NOT EXISTS` 会因索引已存在而跳过，避免启动时持锁）
 - upsert 的 `extend_env_comments` 加 `CASE WHEN 新值空 THEN 保留旧值`：远端 collector 重跑 `_extract_record`（跨集群 pod 本地查不到 ER、产出 `{}`）时不再冲掉 cn12 已推送的工作流信息；同时修了既存问题——本地 `-workflow` pod 进终态时若 ER 已删，原逻辑会把已 enrich 的值冲回 `{}`
 - `_sync_remote_workflow_pods` 按 `created_at >= runner 创建时间-1h`（或 Pending 空值）限定记录范围，避免 runner 名复用撞旧终态记录（实测 0 误排除）
 - `_watch_loop` 断线后改为指数退避重连（5→10→20→40→60s），stream 正常超时后立即重连

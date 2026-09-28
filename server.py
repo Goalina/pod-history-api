@@ -162,6 +162,7 @@ _CREATE_TABLE_SQL = """
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_status ON pod_history(status)",
     "CREATE INDEX IF NOT EXISTS idx_created_at ON pod_history(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_expires_at ON pod_history(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_cluster ON pod_history(cluster)",
     "CREATE INDEX IF NOT EXISTS idx_name ON pod_history(name)",
 ]
