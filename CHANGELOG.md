@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
   - 拿不到迁移锁时校验 `pod_history` 必需列是否齐全：缺列则快速失败重启重试，避免带缺列对外服务；迁移在 autocommit 下逐条提交、非原子，要求所有迁移语句幂等
 
 ### Fixed
+- 修复迁移在繁忙大表上 crashloop：`ALTER TABLE ADD COLUMN IF NOT EXISTS` 即使列已存在也要先拿 `ACCESS EXCLUSIVE` 锁，之前设的 `lock_timeout=15s` 在生产 121 万行表上拿不到锁即超时失败（致命）→ 新 pod 反复重启。改为先 `_schema_ready` 校验，列已齐全则完全跳过 DDL（不再加锁），仅缺列时才执行且不设 `lock_timeout`（等待而非超时崩溃）
 - 补充 `idx_expires_at` 索引：`match_mode=released` 按 `expires_at` 范围过滤，但 `_CREATE_INDEXES_SQL` 只有 `status`/`created_at`/`cluster`/`name`/`source`，缺 `expires_at` 索引，导致全表 Seq Scan；默认 `created` 路径命中 `idx_created_at`，故去掉 `match_mode` 反而更快。50 万行实测：`released` 53.6ms（Parallel Seq Scan）→ 0.118ms（`Index Scan using idx_expires_at`），与 `created` 对齐
 - `_init_db` 迁移顺序：`ALTER TABLE ADD COLUMN source` 必须在 `CREATE INDEX idx_source` 之前执行。原顺序在存量表（`CREATE TABLE IF NOT EXISTS` 跳过）上会因 `source` 列不存在导致建索引崩溃、服务无法启动
 - `_MIGRATE_SQL` 中 `source` 默认值 `'plain'` 更正为 `'unknown'`，与建表 SQL 一致；去掉其中重复的 `idx_source` 建索引（统一由 `_ensure_indexes` 负责）
