@@ -39,6 +39,10 @@ MODE            = os.environ.get("MODE", "standalone")
 
 RUNNER_SYNC_INTERVAL = int(os.environ.get("RUNNER_SYNC_INTERVAL", "30"))
 
+# 集群卡数快照：采集间隔与对齐粒度（秒），默认 5 分钟
+CAPACITY_INTERVAL = int(os.environ.get("CAPACITY_INTERVAL", "300"))
+_CAPACITY_BUCKET  = 300
+
 SKIP_NS = {
     "kube-system", "kube-public", "kube-node-lease",
     "arc-history", "arc-systems",
@@ -198,6 +202,42 @@ _REQUIRED_COLUMNS = {
     "_image", "_exit_code", "_worker_kind", "_worker_tokens", "_worker_run_id",
     "_updated_at",
 }
+
+# ── 集群卡数快照（一集群一行 / 每 CAPACITY_INTERVAL 秒）──────────────────
+# nodes 为 JSON 数组：[{"node_ip","resource_name","service_type","cards"}, ...]
+_CAPACITY_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS cluster_card_snapshot (
+        cluster TEXT NOT NULL,
+        snapshot_time TEXT NOT NULL,
+        total_cards INTEGER DEFAULT 0,
+        used_cards INTEGER DEFAULT 0,
+        node_count INTEGER DEFAULT 0,
+        nodes TEXT DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'ok',
+        error TEXT DEFAULT '',
+        _updated_at TEXT NOT NULL,
+        PRIMARY KEY (cluster, snapshot_time)
+    )
+"""
+
+_CAPACITY_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_cap_time ON cluster_card_snapshot(snapshot_time)",
+    "CREATE INDEX IF NOT EXISTS idx_cap_cluster ON cluster_card_snapshot(cluster)",
+]
+
+_CAPACITY_UPSERT_SQL = """
+    INSERT INTO cluster_card_snapshot
+        (cluster, snapshot_time, total_cards, used_cards, node_count, nodes, status, error, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (cluster, snapshot_time) DO UPDATE SET
+        total_cards = EXCLUDED.total_cards,
+        used_cards = EXCLUDED.used_cards,
+        node_count = EXCLUDED.node_count,
+        nodes = EXCLUDED.nodes,
+        status = EXCLUDED.status,
+        error = EXCLUDED.error,
+        _updated_at = EXCLUDED._updated_at
+"""
 
 _UPSERT_SQL = """
     INSERT INTO pod_history
@@ -362,6 +402,11 @@ def _init_db():
                 # 索引：并发构建 + 无效索引恢复，失败仅告警
                 with mig.cursor() as idx_cur:
                     _ensure_indexes(idx_cur)
+                # 容量快照表（新表，空表建索引无锁竞争）
+                with mig.cursor() as cap_cur:
+                    cap_cur.execute(_CAPACITY_TABLE_SQL)
+                    for sql in _CAPACITY_INDEXES_SQL:
+                        cap_cur.execute(sql)
             finally:
                 with mig.cursor() as unlock:
                     unlock.execute("SELECT pg_advisory_unlock(%s)", (_MIGRATION_LOCK_KEY,))
@@ -1109,9 +1154,17 @@ def _cleanup_old_history():
                 (cutoff.isoformat(),),
             )
             deleted = cur.rowcount
+            cur.execute(
+                "DELETE FROM cluster_card_snapshot WHERE snapshot_time < %s",
+                (cutoff.isoformat(),),
+            )
+            deleted_cap = cur.rowcount
         conn.commit()
-        if deleted:
-            log.info(f"清理历史: 删除 {deleted} 条 {cutoff.isoformat()} 之前记录")
+        if deleted or deleted_cap:
+            log.info(
+                f"清理历史: pod_history {deleted} 条, "
+                f"cluster_card_snapshot {deleted_cap} 条（{cutoff.isoformat()} 之前）"
+            )
     except Exception as e:
         log.error(f"清理历史失败: {e}")
         _put_conn(conn, error=True)
@@ -1127,6 +1180,127 @@ def _cleanup_loop():
             _cleanup_old_history()
         except Exception as e:
             log.error(f"清理历史时出错: {e}")
+
+
+# ──────────────────────────────────────────────────────────
+# 集群卡数快照（collector / standalone 模式）
+# ──────────────────────────────────────────────────────────
+
+def _node_internal_ip(node) -> str:
+    """取节点 InternalIP；无则回退到节点名。"""
+    for addr in (node.status.addresses or []):
+        if addr.type == "InternalIP" and addr.address:
+            return addr.address
+    return node.metadata.name or ""
+
+
+def _capacity_snapshot_time(now: datetime) -> str:
+    """对齐到整 _CAPACITY_BUCKET 秒的 UTC ISO 时间。"""
+    epoch = int(now.timestamp())
+    aligned = epoch - (epoch % _CAPACITY_BUCKET)
+    return datetime.fromtimestamp(aligned, tz=timezone.utc).isoformat()
+
+
+def _write_capacity(snapshot_iso: str, total: int, used: int, node_count: int,
+                    nodes: list, status: str, error: str):
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_CAPACITY_UPSERT_SQL, (
+                CLUSTER_ID, snapshot_iso, total, used, node_count,
+                json.dumps(nodes, ensure_ascii=False), status, error,
+                now_utc().isoformat(),
+            ))
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
+        _put_conn(conn)
+
+
+def _used_cards_by_node() -> dict:
+    """按 (node_name, resource_key) 汇总未终止 Pod 申请的加速卡数。
+
+    以容器 resources.requests 为准（与设备插件 counting 一致），只统计已绑定节点
+    (spec.nodeName 非空) 且未进入 Succeeded/Failed 的 Pod；包含所有 namespace。
+    """
+    used = {}
+    pods = _k8s_core.list_pod_for_all_namespaces().items
+    for p in pods:
+        spec = p.spec
+        if not spec or not spec.node_name:
+            continue
+        phase = (p.status.phase if p.status else "") or ""
+        if phase in ("Succeeded", "Failed"):
+            continue
+        for c in (spec.containers or []):
+            reqs = (c.resources.requests if c.resources else None) or {}
+            for key, val in reqs.items():
+                if not _NPU_RE.search(key):
+                    continue
+                try:
+                    n = int(str(val))
+                except (ValueError, TypeError):
+                    continue
+                if n <= 0:
+                    continue
+                k = (spec.node_name, key)
+                used[k] = used.get(k, 0) + n
+    return used
+
+
+def _collect_capacity():
+    """采集本集群所有节点的加速卡 allocatable 与已用数，写一条快照。
+
+    记录粒度：一个集群每个 _CAPACITY_BUCKET 秒一条，nodes 内为逐节点明细。
+    采集失败（含 Pod 列表失败，会导致 used 不准）也会写一条 status='failed'
+    的记录（如实记录，不伪造成 0）。
+    """
+    snapshot_iso = _capacity_snapshot_time(now_utc())
+    try:
+        nodes = _k8s_core.list_node().items
+        used_map = _used_cards_by_node()
+        entries = []
+        for n in nodes:
+            labels = n.metadata.labels or {}
+            service_type = labels.get("servertype", "")
+            node_ip = _node_internal_ip(n)
+            for key, val in (n.status.allocatable or {}).items():
+                if not _NPU_RE.search(key):
+                    continue
+                try:
+                    cards = int(str(val))
+                except (ValueError, TypeError):
+                    continue
+                if cards <= 0:
+                    continue
+                entries.append({
+                    "node_ip":       node_ip,
+                    "resource_name": key,
+                    "service_type":  service_type,
+                    "cards":         cards,
+                    "used":          used_map.get((n.metadata.name, key), 0),
+                })
+        entries.sort(key=lambda e: (e["node_ip"], e["resource_name"]))
+        total = sum(e["cards"] for e in entries)
+        used_cards = sum(e["used"] for e in entries)
+        node_count = len({e["node_ip"] for e in entries})
+        _write_capacity(snapshot_iso, total, used_cards, node_count, entries, "ok", "")
+        log.info(f"[容量] {CLUSTER_ID or 'local'}: {node_count} 个节点, "
+                 f"总 {total} 卡, 已用 {used_cards} 卡")
+    except Exception as e:
+        _write_capacity(snapshot_iso, 0, 0, 0, [], "failed", str(e))
+        log.error(f"[容量] {CLUSTER_ID or 'local'} 采集失败: {e}")
+
+
+def _capacity_loop():
+    while True:
+        try:
+            _collect_capacity()
+        except Exception as e:
+            log.error(f"[容量] 循环异常: {e}")
+        time.sleep(CAPACITY_INTERVAL)
 
 
 def _er_to_info(er) -> dict:
@@ -1704,6 +1878,94 @@ def query_history(start_time: datetime, end_time: datetime,
     return records
 
 
+def _capacity_rows_to_records(rows) -> list:
+    """DB 行 → 接口记录；由 nodes JSON 额外生成 node_cards 扁平映射。"""
+    result = []
+    for cluster, snapshot_time, total_cards, used_cards, node_count, nodes_json, status, error in rows:
+        try:
+            nodes = json.loads(nodes_json) if nodes_json else []
+            if not isinstance(nodes, list):
+                nodes = []
+        except (json.JSONDecodeError, TypeError):
+            nodes = []
+        node_cards = {}
+        node_used = {}
+        for e in nodes:
+            ip = e.get("node_ip", "")
+            if ip:
+                node_cards[ip] = node_cards.get(ip, 0) + int(e.get("cards", 0) or 0)
+                node_used[ip] = node_used.get(ip, 0) + int(e.get("used", 0) or 0)
+        result.append({
+            "cluster":          cluster,
+            "snapshot_time":    snapshot_time,
+            "total_cards":      total_cards,
+            "used_cards":       used_cards,
+            "available_cards":  (total_cards or 0) - (used_cards or 0),
+            "node_count":       node_count,
+            "node_cards":       node_cards,
+            "node_used":        node_used,
+            "nodes":            nodes,
+            "status":           status,
+            "error":            error,
+        })
+    return result
+
+
+_CAPACITY_SELECT = (
+    "SELECT cluster, snapshot_time, total_cards, used_cards, node_count, nodes, status, error "
+    "FROM cluster_card_snapshot "
+)
+
+
+def query_capacity(start_time: datetime, end_time: datetime, cluster_filter: str = None) -> list:
+    """按时间段查询集群卡数快照（snapshot_time 倒序）。"""
+    conditions = ["snapshot_time >= %s", "snapshot_time <= %s"]
+    params = [start_time.isoformat(), end_time.isoformat()]
+    if cluster_filter:
+        conditions.append("cluster = %s")
+        params.append(cluster_filter)
+    sql = _CAPACITY_SELECT + "WHERE " + " AND ".join(conditions) + " ORDER BY snapshot_time DESC, cluster"
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
+        _put_conn(conn)
+    return _capacity_rows_to_records(rows)
+
+
+def query_capacity_latest(cluster_filter: str = None) -> list:
+    """不带时间时：返回每个集群最近一次快照。"""
+    where = "WHERE c.cluster = %s" if cluster_filter else ""
+    params = [cluster_filter] if cluster_filter else []
+    sql = (
+        "SELECT c.cluster, c.snapshot_time, c.total_cards, c.used_cards, c.node_count, c.nodes, c.status, c.error "
+        "FROM cluster_card_snapshot c "
+        "JOIN (SELECT cluster, MAX(snapshot_time) AS t "
+        "FROM cluster_card_snapshot GROUP BY cluster) m "
+        "ON c.cluster = m.cluster AND c.snapshot_time = m.t "
+        + where + " ORDER BY c.cluster"
+    )
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        _put_conn(conn, error=True)
+        raise
+    else:
+        _put_conn(conn)
+    return _capacity_rows_to_records(rows)
+
+
 # ──────────────────────────────────────────────────────────
 # HTTP Handler（api / standalone 模式）
 # ──────────────────────────────────────────────────────────
@@ -1738,6 +2000,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/health":
             return self._ok({"status": "ok", "service": "pod-history-api", "mode": MODE})
+
+        if path == "/api/v1/clusters/capacity":
+            st_str = params.get("start_time", [None])[0]
+            et_str = params.get("end_time",   [None])[0]
+            cluster_filter = params.get("cluster", [None])[0]
+
+            # 不带时间：返回每个集群最近一次记录
+            if not st_str and not et_str:
+                snapshots = query_capacity_latest(cluster_filter)
+                return self._ok({"count": len(snapshots), "snapshots": snapshots})
+
+            # 带时间：两者必须同时提供
+            if not st_str or not et_str:
+                return self._err("start_time 和 end_time 需同时提供，或都不提供以查询各集群最新记录")
+            start_time = parse_iso(st_str)
+            end_time   = parse_iso(et_str)
+            if not start_time or not end_time:
+                return self._err("时间格式不合法，请使用 ISO 8601 格式")
+            if start_time > end_time:
+                return self._err("start_time 不能晚于 end_time")
+            snapshots = query_capacity(start_time, end_time, cluster_filter)
+            return self._ok({"count": len(snapshots), "snapshots": snapshots})
 
         if path in ("/api/v1/envs/history", "/api/v1/envs/history/atomgit"):
             st_str = params.get("start_time", [None])[0]
@@ -1832,6 +2116,7 @@ if __name__ == "__main__":
         threading.Thread(target=_watcher_watchdog, daemon=True, name="watcher-watchdog").start()
         threading.Thread(target=_flush_loop, daemon=True, name="flush").start()
         threading.Thread(target=_runner_sync_loop, daemon=True, name="runner-sync").start()
+        threading.Thread(target=_capacity_loop, daemon=True, name="capacity").start()
 
     if MODE in ("api", "standalone"):
         threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
