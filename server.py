@@ -210,6 +210,7 @@ _CAPACITY_TABLE_SQL = """
         cluster TEXT NOT NULL,
         snapshot_time TEXT NOT NULL,
         total_cards INTEGER DEFAULT 0,
+        used_cards INTEGER DEFAULT 0,
         node_count INTEGER DEFAULT 0,
         nodes TEXT DEFAULT '[]',
         status TEXT NOT NULL DEFAULT 'ok',
@@ -226,10 +227,11 @@ _CAPACITY_INDEXES_SQL = [
 
 _CAPACITY_UPSERT_SQL = """
     INSERT INTO cluster_card_snapshot
-        (cluster, snapshot_time, total_cards, node_count, nodes, status, error, _updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        (cluster, snapshot_time, total_cards, used_cards, node_count, nodes, status, error, _updated_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (cluster, snapshot_time) DO UPDATE SET
         total_cards = EXCLUDED.total_cards,
+        used_cards = EXCLUDED.used_cards,
         node_count = EXCLUDED.node_count,
         nodes = EXCLUDED.nodes,
         status = EXCLUDED.status,
@@ -1199,13 +1201,13 @@ def _capacity_snapshot_time(now: datetime) -> str:
     return datetime.fromtimestamp(aligned, tz=timezone.utc).isoformat()
 
 
-def _write_capacity(snapshot_iso: str, total: int, node_count: int,
+def _write_capacity(snapshot_iso: str, total: int, used: int, node_count: int,
                     nodes: list, status: str, error: str):
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(_CAPACITY_UPSERT_SQL, (
-                CLUSTER_ID, snapshot_iso, total, node_count,
+                CLUSTER_ID, snapshot_iso, total, used, node_count,
                 json.dumps(nodes, ensure_ascii=False), status, error,
                 now_utc().isoformat(),
             ))
@@ -1217,15 +1219,48 @@ def _write_capacity(snapshot_iso: str, total: int, node_count: int,
         _put_conn(conn)
 
 
+def _used_cards_by_node() -> dict:
+    """按 (node_name, resource_key) 汇总未终止 Pod 申请的加速卡数。
+
+    以容器 resources.requests 为准（与设备插件 counting 一致），只统计已绑定节点
+    (spec.nodeName 非空) 且未进入 Succeeded/Failed 的 Pod；包含所有 namespace。
+    """
+    used = {}
+    pods = _k8s_core.list_pod_for_all_namespaces().items
+    for p in pods:
+        spec = p.spec
+        if not spec or not spec.node_name:
+            continue
+        phase = (p.status.phase if p.status else "") or ""
+        if phase in ("Succeeded", "Failed"):
+            continue
+        for c in (spec.containers or []):
+            reqs = (c.resources.requests if c.resources else None) or {}
+            for key, val in reqs.items():
+                if not _NPU_RE.search(key):
+                    continue
+                try:
+                    n = int(str(val))
+                except (ValueError, TypeError):
+                    continue
+                if n <= 0:
+                    continue
+                k = (spec.node_name, key)
+                used[k] = used.get(k, 0) + n
+    return used
+
+
 def _collect_capacity():
-    """采集本集群所有节点的加速卡 allocatable，写一条快照。
+    """采集本集群所有节点的加速卡 allocatable 与已用数，写一条快照。
 
     记录粒度：一个集群每个 _CAPACITY_BUCKET 秒一条，nodes 内为逐节点明细。
-    采集失败也会写一条 status='failed' 的记录（如实记录，不伪造成 0）。
+    采集失败（含 Pod 列表失败，会导致 used 不准）也会写一条 status='failed'
+    的记录（如实记录，不伪造成 0）。
     """
     snapshot_iso = _capacity_snapshot_time(now_utc())
     try:
         nodes = _k8s_core.list_node().items
+        used_map = _used_cards_by_node()
         entries = []
         for n in nodes:
             labels = n.metadata.labels or {}
@@ -1245,14 +1280,17 @@ def _collect_capacity():
                     "resource_name": key,
                     "service_type":  service_type,
                     "cards":         cards,
+                    "used":          used_map.get((n.metadata.name, key), 0),
                 })
         entries.sort(key=lambda e: (e["node_ip"], e["resource_name"]))
         total = sum(e["cards"] for e in entries)
+        used_cards = sum(e["used"] for e in entries)
         node_count = len({e["node_ip"] for e in entries})
-        _write_capacity(snapshot_iso, total, node_count, entries, "ok", "")
-        log.info(f"[容量] {CLUSTER_ID or 'local'}: {node_count} 个节点, {total} 张卡")
+        _write_capacity(snapshot_iso, total, used_cards, node_count, entries, "ok", "")
+        log.info(f"[容量] {CLUSTER_ID or 'local'}: {node_count} 个节点, "
+                 f"总 {total} 卡, 已用 {used_cards} 卡")
     except Exception as e:
-        _write_capacity(snapshot_iso, 0, 0, [], "failed", str(e))
+        _write_capacity(snapshot_iso, 0, 0, 0, [], "failed", str(e))
         log.error(f"[容量] {CLUSTER_ID or 'local'} 采集失败: {e}")
 
 
@@ -1843,7 +1881,7 @@ def query_history(start_time: datetime, end_time: datetime,
 def _capacity_rows_to_records(rows) -> list:
     """DB 行 → 接口记录；由 nodes JSON 额外生成 node_cards 扁平映射。"""
     result = []
-    for cluster, snapshot_time, total_cards, node_count, nodes_json, status, error in rows:
+    for cluster, snapshot_time, total_cards, used_cards, node_count, nodes_json, status, error in rows:
         try:
             nodes = json.loads(nodes_json) if nodes_json else []
             if not isinstance(nodes, list):
@@ -1851,25 +1889,30 @@ def _capacity_rows_to_records(rows) -> list:
         except (json.JSONDecodeError, TypeError):
             nodes = []
         node_cards = {}
+        node_used = {}
         for e in nodes:
             ip = e.get("node_ip", "")
             if ip:
                 node_cards[ip] = node_cards.get(ip, 0) + int(e.get("cards", 0) or 0)
+                node_used[ip] = node_used.get(ip, 0) + int(e.get("used", 0) or 0)
         result.append({
-            "cluster":       cluster,
-            "snapshot_time": snapshot_time,
-            "total_cards":   total_cards,
-            "node_count":    node_count,
-            "node_cards":    node_cards,
-            "nodes":         nodes,
-            "status":        status,
-            "error":         error,
+            "cluster":          cluster,
+            "snapshot_time":    snapshot_time,
+            "total_cards":      total_cards,
+            "used_cards":       used_cards,
+            "available_cards":  (total_cards or 0) - (used_cards or 0),
+            "node_count":       node_count,
+            "node_cards":       node_cards,
+            "node_used":        node_used,
+            "nodes":            nodes,
+            "status":           status,
+            "error":            error,
         })
     return result
 
 
 _CAPACITY_SELECT = (
-    "SELECT cluster, snapshot_time, total_cards, node_count, nodes, status, error "
+    "SELECT cluster, snapshot_time, total_cards, used_cards, node_count, nodes, status, error "
     "FROM cluster_card_snapshot "
 )
 
@@ -1902,7 +1945,7 @@ def query_capacity_latest(cluster_filter: str = None) -> list:
     where = "WHERE c.cluster = %s" if cluster_filter else ""
     params = [cluster_filter] if cluster_filter else []
     sql = (
-        "SELECT c.cluster, c.snapshot_time, c.total_cards, c.node_count, c.nodes, c.status, c.error "
+        "SELECT c.cluster, c.snapshot_time, c.total_cards, c.used_cards, c.node_count, c.nodes, c.status, c.error "
         "FROM cluster_card_snapshot c "
         "JOIN (SELECT cluster, MAX(snapshot_time) AS t "
         "FROM cluster_card_snapshot GROUP BY cluster) m "

@@ -8,10 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 
 ### Added
 - 新增集群卡数快照与查询接口：
-  - collector/standalone 新增 `_capacity_loop` 线程，每 `CAPACITY_INTERVAL`（默认 300s，`snapshot_time` 对齐整 5 分钟）采集本集群各节点加速卡 `allocatable`，写入新表 `cluster_card_snapshot`（**一集群一行**）：`total_cards`、`node_count`、`nodes`（JSON 数组，含 `node_ip`/`resource_name`/`service_type`/`cards`）
+  - collector/standalone 新增 `_capacity_loop` 线程，每 `CAPACITY_INTERVAL`（默认 300s，`snapshot_time` 对齐整 5 分钟）采集本集群各节点加速卡 `allocatable`（总卡）与已用卡，写入新表 `cluster_card_snapshot`（**一集群一行**）：`total_cards`、`used_cards`、`node_count`、`nodes`（JSON 数组，含 `node_ip`/`resource_name`/`service_type`/`cards`/`used`）
+  - `used`（已用）= 按 `(node, 资源键)` 汇总未终止（非 Succeeded/Failed）且已绑定节点的 Pod 的 `resources.requests` 加速卡数，含所有 namespace；`available = total - used`
   - `service_type` 取节点 label `servertype`；资源键匹配 `ascend|npu|gpu`，跳过值为 0 的键与无加速卡的节点；`node_ip` 取 `InternalIP`
   - 采集失败写一条 `status='failed'`（`total_cards=0`、`nodes=[]`、`error` 记原因），如实记录不伪造成 0
-  - 新增接口 `GET /api/v1/clusters/capacity[?cluster=..]`：**不带时间时返回各集群最近一次记录**（看最新直接省略时间参数）；**带 `start_time`/`end_time` 时返回该区间内全部快照**（两者需同时提供）。每条含 `node_cards`（`node_ip -> 卡数` 扁平映射，便于快速查看）与 `nodes`（详细字段）
+  - 新增接口 `GET /api/v1/clusters/capacity[?cluster=..]`：**不带时间时返回各集群最近一次记录**（看最新直接省略时间参数）；**带 `start_time`/`end_time` 时返回该区间内全部快照**（两者需同时提供）。每条含 `total_cards`/`used_cards`/`available_cards`、`node_cards`（`node_ip -> 总卡`）与 `node_used`（`node_ip -> 已用`）扁平映射，以及 `nodes` 明细（含 per-node `cards`/`used`）
   - 保留期沿用 30 天（并入现有每日清理）
 - 多机 CI worker pod 自动关联到拉起它的 job pod：对 LWS（`leaderworkerset.sigs.k8s.io/name` label）和 Volcano Job（`batch.volcano.sh` ownerRef）等由 K8s 控制器创建的 worker pod，由 `_sync_worker_pods` 事后在 DB 中关联到同 cluster 有工作流信息的 job pod，继承其 `extend_env_comments`（PR / workflow_run_id 等）与 `source`；不修改任何 CI/业务代码
   - **路径 A1 — run-id label 精确匹配**（sglang 多机 Volcano）：worker pod 带 `run-id` label（= `github.run_id`，sglang 模板 `k8s_multi_pd_*.yaml.jinja2` 注入），与 job 的 `extend_env_comments.workflow_run_id` 精确相等即命中，确定性最高
