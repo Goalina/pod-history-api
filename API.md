@@ -2,12 +2,14 @@
 
 ## 路由总览
 
-系统提供两个查询路由，返回的**单条记录结构完全一致**（见下方「响应字段说明」），区别只在于「查哪些 Pod」和「是否分页」。
+系统提供三类查询路由：两类 **Pod 历史**（`/envs/history`、`/envs/history/atomgit`，单条记录结构一致），一类 **集群卡数快照**（`/clusters/capacity`，记录结构不同，见文末章节）。
 
 | 路由 | 查询范围 | 分页 | 适用场景 |
 |---|---|---|---|
 | `GET /api/v1/envs/history` | **全部来源**的 Pod（`github-action` / `atomgit-action` / `unknown`） | ❌ 一次性全量返回 | 跨来源统计、NPU 占用汇总、兼容历史调用方 |
 | `GET /api/v1/envs/history/atomgit` | **仅 AtomGit CI**（`source=atomgit-action`）拉起的 Pod | ✅ `limit`/`offset` 分页 | 只关心 AtomGit CI 任务、数据量大需翻页 |
+| `GET /api/v1/clusters/capacity` | 各集群加速卡 **总/已用/可用**（含节点级明细） | ❌ | 集群卡数总览与趋势 |
+| `GET /api/v1/health` | 健康检查 | — | 探活 |
 
 两个路由共享同一套过滤参数（`start_time` / `end_time` / `match_mode` / `status` / `name_prefix` / `cluster`），下方「请求参数」章节通用。差异仅两点：
 
@@ -468,4 +470,98 @@ while True:
     params["offset"] += params["limit"]
 
 print(f"共 {len(all_envs)} 条 AtomGit CI 记录")
+```
+
+---
+
+## `GET /api/v1/clusters/capacity`
+
+集群加速卡数快照。每个 collector 每 **5 分钟**采集一次本集群各节点的加速卡 `allocatable`（总卡）与已用卡，写库后由本接口聚合查询；数据保留 30 天。
+
+### 请求参数
+
+| 参数 | 必填 | 类型 | 说明 |
+|---|---|---|---|
+| `start_time` | 视情况 | string | ISO 8601，如 `2026-09-30T00:00:00Z` |
+| `end_time` | 视情况 | string | ISO 8601 |
+| `cluster` | 否 | string | 按集群 ID 过滤，如 `hk-001` |
+
+- **不带 `start_time`/`end_time`**：返回**每个集群最近一次**记录（看最新直接省略时间参数）。
+- **同时带 `start_time`/`end_time`**：返回该区间内**全部**快照（每 5 分钟一条）。
+- 只提供其中一个：返回 `400`。
+
+### 响应格式
+
+```json
+{
+  "count": 1,
+  "snapshots": [
+    {
+      "cluster": "gy-006",
+      "snapshot_time": "2026-09-30T09:45:00+00:00",
+      "total_cards": 28,
+      "used_cards": 3,
+      "available_cards": 25,
+      "node_count": 2,
+      "node_cards": { "10.0.1.111": 20, "172.22.6.177": 8 },
+      "node_used":  { "10.0.1.111": 0, "172.22.6.177": 3 },
+      "nodes": [
+        {"node_ip": "10.0.1.111", "resource_name": "huawei.com/ascend-1980", "service_type": "", "cards": 20, "used": 0},
+        {"node_ip": "172.22.6.177", "resource_name": "huawei.com/ascend-1980", "service_type": "Ascend910B-20", "cards": 8, "used": 3}
+      ],
+      "status": "ok",
+      "error": ""
+    }
+  ]
+}
+```
+
+### 字段说明
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `cluster` | string | 集群 ID |
+| `snapshot_time` | string | 快照时间（ISO 8601 UTC，**对齐到整 5 分钟**） |
+| `total_cards` | integer | 该集群所有节点加速卡 `allocatable` 之和 |
+| `used_cards` | integer | 已用卡：未终止（非 Succeeded/Failed）且已绑定节点的 Pod 的 `resources.requests` 加速卡数之和（含所有 namespace） |
+| `available_cards` | integer | `total_cards - used_cards` |
+| `node_count` | integer | 有加速卡的节点数 |
+| `node_cards` | object | `node_ip -> 总卡数` 扁平映射 |
+| `node_used` | object | `node_ip -> 已用卡数` 扁平映射 |
+| `nodes` | array | 节点级明细（见下） |
+| `status` | string | `ok` / `failed` |
+| `error` | string | `status=failed` 时的原因 |
+
+`nodes[]` 每项：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `node_ip` | string | 节点 InternalIP |
+| `resource_name` | string | 加速卡资源键，如 `huawei.com/ascend-1980`、`huawei.com/ascend-310`、`huawei.com/Ascend910` |
+| `service_type` | string | 节点 label `servertype`（无则空串） |
+| `cards` | integer | 该节点该资源的总卡数 |
+| `used` | integer | 该节点该资源的已用卡数 |
+
+- 资源键匹配 `ascend`/`npu`/`gpu`；**跳过值为 0 的键**与无加速卡的节点。
+- 采集失败时写入一条 `status="failed"`：`total_cards=used_cards=node_count=0`、`nodes=[]`，`error` 记原因（如实记录，不伪造成 0）。
+
+### 错误响应
+
+| HTTP | 触发条件 |
+|---|---|
+| `400` | 只提供 `start_time`/`end_time` 之一、时间格式非法、`start_time > end_time` |
+| `404` | 路径不存在 |
+
+### 请求示例
+
+```bash
+# 1) 各集群最新
+curl "https://pod-history-api.test.osinfra.cn/api/v1/clusters/capacity"
+
+# 2) 单集群最新
+curl "https://pod-history-api.test.osinfra.cn/api/v1/clusters/capacity?cluster=hk-001"
+
+# 3) 单集群某时间段（每 5 分钟一条）
+curl "https://pod-history-api.test.osinfra.cn/api/v1/clusters/capacity?\
+cluster=hk-001&start_time=2026-09-30T00:00:00Z&end_time=2026-09-30T06:00:00Z"
 ```

@@ -230,6 +230,14 @@ K8s 集群 Pod 历史记录服务，对外提供符合 [resource-deploy-core](ht
 | `service` | 服务名称，固定 `"pod-history-api"` |
 | `mode` | 当前运行模式：`collector` / `api` / `standalone` |
 
+### `GET /api/v1/envs/history/atomgit`
+
+仅返回 AtomGit CI（`source=atomgit-action`）拉起的 Pod，过滤参数与主路由一致，额外支持 `limit`（默认 1000，范围 1~5000）/ `offset` 分页。响应为 `count` / `limit` / `offset` / `envs`（不返回 `total`，以避免每次请求回表 COUNT 导致大区间变慢）。详见 [API.md](./API.md)。
+
+### `GET /api/v1/clusters/capacity`
+
+各集群加速卡数快照（每集群每 5 分钟一条，保留 30 天）。参数：`cluster`（可选）、`start_time`/`end_time`（可选，**不带则返回各集群最新一条**，带则返回区间内全部）。每条含 `total_cards` / `used_cards` / `available_cards`、`node_cards`/`node_used`（`node_ip -> 卡数`）与 `nodes`（节点级明细：`node_ip`/`resource_name`/`service_type`/`cards`/`used`）。详见 [API.md](./API.md)。
+
 ---
 
 ## 部署
@@ -272,6 +280,7 @@ curl "http://localhost:18080/api/v1/envs/history?start_time=2026-07-01T00:00:00Z
 | `RETENTION_DAYS` | `30` | 历史记录保留天数 |
 | `FLUSH_INTERVAL` | `5` | 写入缓冲刷盘间隔（秒） |
 | `RUNNER_SYNC_INTERVAL` | `30` | EphemeralRunner 工作流信息同步间隔（秒） |
+| `CAPACITY_INTERVAL` | `300` | 集群卡数快照采集/对齐粒度（秒），`snapshot_time` 对齐到其整数倍 |
 
 ---
 
