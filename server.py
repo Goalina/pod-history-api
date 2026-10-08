@@ -1276,7 +1276,12 @@ def _collect_capacity():
         entries = []
         for n in node_items:
             meta = n.get("metadata") or {}
-            service_type = (meta.get("labels") or {}).get("servertype", "")
+            labels = meta.get("labels") or {}
+            # 跳过 Liqo 等虚拟节点（如 hk-001 里的 gy001/sz-lab/wlcb001），
+            # 虚拟节点的卡数不计入统计。
+            if labels.get("liqo.io/type") == "virtual-node":
+                continue
+            service_type = labels.get("servertype", "")
             node_name = meta.get("name", "")
             node_ip = _node_internal_ip(n)
             for key, val in (((n.get("status") or {}).get("allocatable")) or {}).items():
