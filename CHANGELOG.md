@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
+- 新增远程集群 history 代理接口 `GET /api/v1/envs/history/<cluster>`（如 `/api/v1/envs/history/wlcb`）：把目标集群 `resource-api`（resource-deploy-core 3.8.1）的 `/api/v1/envs/history` 原样返回，参数（`start_time`/`end_time`/`match_mode`/`status`/`name_prefix`/`limit`/`offset`）透传，响应保持上游 `count`/`envs` 结构
+  - 适用场景：api 模式的 Pod 与目标集群之间只有 apiserver 可达，且 apiserver 的 service-proxy 会消耗 `Authorization` 头，无法把 resource-api 的应用层 api-key 透传过去
+  - 实现：用目标集群 kubeconfig 经 apiserver 建 `pods/portforward` 原始 TCP 隧道，在隧道内自行构造带 `Authorization` 的 HTTP 请求；不 exec、不改动目标集群工作负载
+  - api-key 来源：优先配置里的 `api_key`；否则用 kubeconfig 读目标 `arc-system/api-keys` Secret 取 caller=`external-history-reader`（scope `envs:read`），带 60s 缓存
+  - 配置：环境变量 `REMOTE_HISTORY_TARGETS`（JSON，key=集群标识）；兼容简写 `WLCB_KUBECONFIG`
+  - 协议：目标未配置 → 404；`start_time`/`end_time` 缺失或非法 → 400；upstream 不可达 → 502；上游非 200 原样透传状态码
+  - 可选访问令牌：目标配置里设 `access_token` 后，该路由要求请求带 `X-Auth-Token`（或 `?token=`），不设则不校验
+  - 部署：`pod-history-api-server` 需 Vault 注入目标集群 kubeconfig（env `WLCB_KUBECONFIG`）；目标集群侧需给该 kubeconfig 对应 ServiceAccount 授权 `pods` get/list、`pods/portforward` get+create、`secrets` get（`resourceNames: api-keys`），清单见 `rbac/pod-history-wlcb-prtest.yaml`
 - 新增集群卡数快照与查询接口：
   - collector/standalone 新增 `_capacity_loop` 线程，每 `CAPACITY_INTERVAL`（默认 300s，`snapshot_time` 对齐整 5 分钟）采集本集群各节点加速卡 `allocatable`（总卡）与已用卡，写入新表 `cluster_card_snapshot`（**一集群一行**）：`total_cards`、`used_cards`、`node_count`、`nodes`（JSON 数组，含 `node_ip`/`resource_name`/`service_type`/`cards`/`used`）
   - `used`（已用）= 按 `(node, 资源键)` 汇总未终止（非 Succeeded/Failed）且已绑定节点的 Pod 的 `resources.requests` 加速卡数，含所有 namespace；`available = total - used`

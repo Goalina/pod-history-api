@@ -124,6 +124,22 @@ spec:
     type: RollingUpdate
   template:
     metadata:
+      annotations:
+        # Vault 注入连 wlcb 的 kubeconfig（专用 SA arc-system/pod-history-wlcb-prtest），
+        # 供 /api/v1/envs/history/<cluster> 远程代理经 pods/portforward 访问 resource-api
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-wlcb-prtest.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-wlcb-prtest.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-wlcb-prtest.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.ascendwlcbPrtest }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        # Vault server 用自签/内网 CA，节点未内置该 CA，故跳过校验（与各 collector 保持一致）；
+        # 属内网可信链路下的折中，后续如启用正式 CA 可移除此项
+        vault.hashicorp.com/tls-skip-verify: "true"
       labels:
         app: pod-history-api-server
     spec:
@@ -148,6 +164,8 @@ spec:
               value: "30"
             - name: DATABASE_URL
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
+            - name: WLCB_KUBECONFIG
+              value: "/vault/secrets/wlcb-prtest.yaml"
           resources:
             requests:
               cpu: "500m"
@@ -167,6 +185,14 @@ spec:
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 30
+      volumes:
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
 
 ---
 # ── Collector: gy006 (本集群) ──────────────────────────────
