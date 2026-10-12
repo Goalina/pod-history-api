@@ -137,6 +137,8 @@ spec:
         vault.hashicorp.com/agent-pre-populate-only: "true"
         vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
         vault.hashicorp.com/role: pod-history-api
+        # Vault server 用自签/内网 CA，节点未内置该 CA，故跳过校验（与各 collector 保持一致）；
+        # 属内网可信链路下的折中，后续如启用正式 CA 可移除此项
         vault.hashicorp.com/tls-skip-verify: "true"
       labels:
         app: pod-history-api-server

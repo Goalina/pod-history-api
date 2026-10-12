@@ -151,10 +151,16 @@ _REMOTE_CLIENTS: dict[str, k8s_client.CoreV1Api] = {}
 _REMOTE_CLIENTS_LOCK = threading.Lock()
 _REMOTE_KEY_CACHE: dict[tuple, tuple] = {}
 _REMOTE_KEY_TTL = 60  # 秒
+_REMOTE_KEY_CACHE_LOCK = threading.Lock()
+_REMOTE_SOCK_TIMEOUT = int(os.environ.get("REMOTE_HISTORY_TIMEOUT", "30"))  # 隧道读写超时(秒)
 
 
 def _remote_core_api(target: dict) -> k8s_client.CoreV1Api:
-    """按 kubeconfig 建/取（带缓存）目标集群 CoreV1Api。"""
+    """按 kubeconfig 建/取（带缓存）目标集群 CoreV1Api。
+
+    客户端按 kubeconfig 路径缓存；kubeconfig 轮换后需重启 Pod 才能生效
+    （Vault 注入为 pre-populate-only，本身也要重启才刷新，故一致）。
+    """
     path = target.get("kubeconfig") or ""
     if not path:
         raise RuntimeError("目标未配置 kubeconfig")
@@ -176,30 +182,35 @@ def _remote_api_key(core: k8s_client.CoreV1Api, target: dict) -> str:
     ns = target.get("namespace", "arc-system")
     caller = target.get("api_key_caller", "external-history-reader")
     cache_key = (ns, secret_name, caller)
-    now = time.monotonic()
     cached = _REMOTE_KEY_CACHE.get(cache_key)
-    if cached and now - cached[1] < _REMOTE_KEY_TTL:
+    if cached and time.monotonic() - cached[1] < _REMOTE_KEY_TTL:
         return cached[0]
 
-    secret = core.read_namespaced_secret(secret_name, ns)
-    raw = (secret.data or {}).get("keys.json", "")
-    keys = json.loads(base64.b64decode(raw).decode()) if raw else {}
-    key = ""
-    for k, v in keys.items():
-        if (v.get("caller") if isinstance(v, dict) else v) == caller:
-            key = k
-            break
-    if not key:  # 回退：任一带 envs:read 或 * 的 key
+    with _REMOTE_KEY_CACHE_LOCK:
+        # double-check：并发过期时只让一个线程回源读 Secret，避免惊群
+        cached = _REMOTE_KEY_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached[1] < _REMOTE_KEY_TTL:
+            return cached[0]
+
+        secret = core.read_namespaced_secret(secret_name, ns)
+        raw = (secret.data or {}).get("keys.json", "")
+        keys = json.loads(base64.b64decode(raw).decode()) if raw else {}
+        key = ""
         for k, v in keys.items():
-            scopes = v.get("scopes", []) if isinstance(v, dict) else ["*"]
-            if "*" in scopes or "envs:read" in scopes:
+            if (v.get("caller") if isinstance(v, dict) else v) == caller:
                 key = k
                 break
-    if not key:
-        raise RuntimeError(f"Secret {ns}/{secret_name} 中未找到可用 api-key")
+        if not key:  # 回退：任一带 envs:read 或 * 的 key
+            for k, v in keys.items():
+                scopes = v.get("scopes", []) if isinstance(v, dict) else ["*"]
+                if "*" in scopes or "envs:read" in scopes:
+                    key = k
+                    break
+        if not key:
+            raise RuntimeError(f"Secret {ns}/{secret_name} 中未找到可用 api-key")
 
-    _REMOTE_KEY_CACHE[cache_key] = (key, now)
-    return key
+        _REMOTE_KEY_CACHE[cache_key] = (key, time.monotonic())
+        return key
 
 
 def _remote_history_request(target: dict, path: str, query: dict) -> tuple[int, str]:
@@ -235,6 +246,8 @@ def _remote_history_request(target: dict, path: str, query: dict) -> tuple[int, 
     )
     try:
         sock = pf.socket(port)
+        # 必须设超时：上游挂起时 recv 会永久阻塞，ThreadingHTTPServer 线程被占满后服务不可用
+        sock.settimeout(_REMOTE_SOCK_TIMEOUT)
         request = (
             f"GET {req_path} HTTP/1.1\r\n"
             f"Host: 127.0.0.1\r\n"
@@ -2229,8 +2242,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body)
         except (json.JSONDecodeError, TypeError):
+            # 不把上游原始 body 回给调用方（可能含内部地址/凭据细节），仅服务端记录
+            log.error(
+                f"上游非 JSON 响应 [{cluster}]: status={status}, body={body[:2000]}"
+            )
             return self._ok(
-                {"error": "upstream returned non-JSON", "raw": body[:2000]},
+                {"error": "upstream returned non-JSON response", "count": 0, "envs": []},
                 502 if status >= 500 else status,
             )
         return self._ok(data, status)
@@ -2272,10 +2289,11 @@ class Handler(BaseHTTPRequestHandler):
             snapshots = query_capacity(start_time, end_time, cluster_filter)
             return self._ok({"count": len(snapshots), "snapshots": snapshots})
 
-        # 远程集群代理：/api/v1/envs/history/<cluster>（atomgit 除外，见下）
+        # 远程集群代理：/api/v1/envs/history/<cluster>
+        # 只在配置了该集群时才接管，避免遮挡未来的本地子路由（如 /github）
         if path.startswith("/api/v1/envs/history/"):
             remote_cluster = path[len("/api/v1/envs/history/"):]
-            if remote_cluster and remote_cluster != "atomgit":
+            if remote_cluster in REMOTE_HISTORY_TARGETS:
                 return self._remote_history(remote_cluster, params)
 
         if path in ("/api/v1/envs/history", "/api/v1/envs/history/atomgit"):
