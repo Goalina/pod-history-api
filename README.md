@@ -234,6 +234,16 @@ K8s 集群 Pod 历史记录服务，对外提供符合 [resource-deploy-core](ht
 
 仅返回 AtomGit CI（`source=atomgit-action`）拉起的 Pod，过滤参数与主路由一致，额外支持 `limit`（默认 1000，范围 1~5000）/ `offset` 分页。响应为 `count` / `limit` / `offset` / `envs`（不返回 `total`，以避免每次请求回表 COUNT 导致大区间变慢）。详见 [API.md](./API.md)。
 
+### `GET /api/v1/envs/history/<cluster>`（远程集群代理）
+
+把目标集群 **`resource-api`（resource-deploy-core 3.8.1）** 的 `/api/v1/envs/history` 原样代理返回，用于目标集群的 env 历史由 resource-api 管理、本服务未采集的场景（如 `wlcb`）。参数与主路由一致（`start_time`/`end_time` 必填，`match_mode`/`status`/`name_prefix`/`limit`/`offset` 透传），响应保持上游 `count`/`envs`。
+
+工作原理：经目标集群 apiserver 建 `pods/portforward` 原始 TCP 隧道（规避 service-proxy 消耗 `Authorization` 头的问题），在隧道内自行构造带 `Authorization` 的 HTTP 请求；api-key 优先取配置 `api_key`，否则读目标 `arc-system/api-keys` Secret。需为目标集群 kubeconfig 对应身份授予 `pods` get/list、`pods/portforward` get+create、`secrets` get（限 `api-keys`），清单见 `rbac/pod-history-wlcb-prtest.yaml`。详见 [API.md](./API.md)。
+
+```bash
+curl "http://localhost:18080/api/v1/envs/history/wlcb?start_time=2026-10-10T00:00:00Z&end_time=2026-10-12T00:00:00Z"
+```
+
 ### `GET /api/v1/clusters/capacity`
 
 各集群加速卡数快照（每集群每 5 分钟一条，保留 30 天）。参数：`cluster`（可选）、`start_time`/`end_time`（可选，**不带则返回各集群最新一条**，带则返回区间内全部）。每条含 `total_cards` / `used_cards` / `available_cards`、`node_cards`/`node_used`（`node_ip -> 卡数`）与 `nodes`（节点级明细：`node_ip`/`resource_name`/`service_type`/`cards`/`used`）。详见 [API.md](./API.md)。
@@ -281,6 +291,9 @@ curl "http://localhost:18080/api/v1/envs/history?start_time=2026-07-01T00:00:00Z
 | `FLUSH_INTERVAL` | `5` | 写入缓冲刷盘间隔（秒） |
 | `RUNNER_SYNC_INTERVAL` | `30` | EphemeralRunner 工作流信息同步间隔（秒） |
 | `CAPACITY_INTERVAL` | `300` | 集群卡数快照采集/对齐粒度（秒），`snapshot_time` 对齐到其整数倍 |
+| `REMOTE_HISTORY_TARGETS` | — | 远程集群代理目标（JSON，key=集群标识，见 `GET /api/v1/envs/history/<cluster>`）；仅 api 模式使用 |
+| `WLCB_KUBECONFIG` | — | `REMOTE_HISTORY_TARGETS` 的简写：自动注册 `wlcb` 目标，值为其 kubeconfig 路径 |
+| `REMOTE_HISTORY_TIMEOUT` | `30` | 远程代理隧道 socket 读写超时（秒） |
 
 ---
 
