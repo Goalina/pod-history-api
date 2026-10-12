@@ -8,6 +8,7 @@
 |---|---|---|---|
 | `GET /api/v1/envs/history` | **全部来源**的 Pod（`github-action` / `atomgit-action` / `unknown`） | ❌ 一次性全量返回 | 跨来源统计、NPU 占用汇总、兼容历史调用方 |
 | `GET /api/v1/envs/history/atomgit` | **仅 AtomGit CI**（`source=atomgit-action`）拉起的 Pod | ✅ `limit`/`offset` 分页 | 只关心 AtomGit CI 任务、数据量大需翻页 |
+| `GET /api/v1/envs/history/<cluster>` | **远程代理**：目标集群 `resource-api` 的 env 历史（如 `wlcb`） | 由上游决定（透传 `limit`/`offset`） | 查询由 resource-api 管理、本服务未采集的集群历史 |
 | `GET /api/v1/clusters/capacity` | 各集群加速卡 **总/已用/可用**（含节点级明细） | ❌ | 集群卡数总览与趋势 |
 | `GET /api/v1/health` | 健康检查 | — | 探活 |
 
@@ -471,6 +472,34 @@ while True:
 
 print(f"共 {len(all_envs)} 条 AtomGit CI 记录")
 ```
+
+---
+
+## `GET /api/v1/envs/history/<cluster>`（远程集群代理）
+
+将目标集群 **`resource-api`（resource-deploy-core 3.8.1）**的 `/api/v1/envs/history` 原样代理返回，适用于目标集群的 env 历史**由 resource-api 管理、并非本服务采集**的场景（如 `wlcb`）。
+
+**请求参数**：与主路由一致（`start_time`/`end_time` 必填，`match_mode`/`status`/`name_prefix`/`limit`/`offset` 透传给上游）。
+
+**响应**：保持上游结构（`count` / `envs`）。
+
+**示例**：
+
+```bash
+curl "https://pod-history-api.test.osinfra.cn/api/v1/envs/history/wlcb?start_time=2026-10-10T00:00:00Z&end_time=2026-10-12T00:00:00Z"
+```
+
+**错误**：
+
+| 状态码 | 触发条件 |
+|---|---|
+| `400` | 缺少/非法 `start_time`、`end_time`，或 `match_mode` 非法 |
+| `404` | 该 `<cluster>` 未在服务端配置 |
+| `401` | 目标配置了 `access_token`，但请求未带 `X-Auth-Token` / `?token=` 或值不符 |
+| `502` | 无法连接目标集群（kubeconfig 缺失、找不到 Running 的 resource-api pod、隧道失败等） |
+| 其他 | 上游非 200 时原样透传其状态码 |
+
+**实现说明**：api 模式的 Pod 与目标集群之间通常只有 apiserver 可达，而 apiserver 的 service-proxy 会消耗 `Authorization` 头而无法透传应用层 api-key，故采用 `pods/portforward` 建原始 TCP 隧道后在隧道内自行构造带 `Authorization` 的 HTTP 请求。目标集群需为所持 kubeconfig 对应的 ServiceAccount 授予 `pods/portforward: create`（见 `rbac/wlcb-history-proxy.yaml`）。
 
 ---
 

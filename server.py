@@ -10,6 +10,7 @@ Pod 历史记录服务 — GET /api/v1/envs/history
 存储：PostgreSQL（单库多集群，cluster 列区分）
 """
 
+import base64
 import json
 import logging
 import os
@@ -18,12 +19,13 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 from kubernetes import client as k8s_client, config as k8s_config, watch as k8s_watch
+from kubernetes.stream import portforward
 
 # ──────────────────────────────────────────────────────────
 # 配置
@@ -97,6 +99,173 @@ def _init_k8s():
 
 if MODE in ("collector", "standalone"):
     _init_k8s()
+
+
+# ──────────────────────────────────────────────────────────
+# 远程集群 resource-api history 代理（pods/portforward 隧道）
+# ──────────────────────────────────────────────────────────
+# 场景：api 模式的 Pod 与目标集群（如 wlcb）之间只有 apiserver 可达，且
+# apiserver 的 service-proxy 会消耗掉 Authorization 头，无法把 resource-api
+# 的应用层 api-key 透传过去。因此改用 pods/portforward 建立一条原始 TCP 隧道，
+# 在隧道内自行构造 HTTP 请求（含 Authorization），把目标集群 resource-api 的
+# /api/v1/envs/history 原样返回。
+#
+# 配置：环境变量 REMOTE_HISTORY_TARGETS（JSON），key=路由后缀（集群标识），
+# value 为目标配置，缺省项用 _DEFAULT_REMOTE_TARGET 补齐。示例：
+#   {"wlcb": {"kubeconfig": "/vault/secrets/wlcb001.yaml",
+#             "namespace": "arc-system",
+#             "label_selector": "app=resource-api",
+#             "port": 8080,
+#             "api_key_secret": "api-keys",
+#             "api_key_caller": "external-history-reader",
+#             "api_key": "",
+#             "access_token": ""}}
+# 兼容简写：WLCB_KUBECONFIG 存在且未显式配置时自动注册 wlcb 目标。
+_DEFAULT_REMOTE_TARGET = {
+    "namespace": "arc-system",
+    "label_selector": "app=resource-api",
+    "port": 8080,
+    "api_key_secret": "api-keys",
+    "api_key_caller": "external-history-reader",
+    "api_key": "",       # 非空则直接用该 key，不再读 Secret
+    "access_token": "",  # 非空则对外路由要求校验该 token
+}
+
+REMOTE_HISTORY_TARGETS: dict[str, dict] = {}
+_remote_raw = os.environ.get("REMOTE_HISTORY_TARGETS", "")
+if _remote_raw:
+    try:
+        for _name, _cfg in (json.loads(_remote_raw) or {}).items():
+            REMOTE_HISTORY_TARGETS[_name] = {**_DEFAULT_REMOTE_TARGET, **(_cfg or {})}
+    except Exception as _e:
+        log.error(f"REMOTE_HISTORY_TARGETS 解析失败，已忽略: {_e}")
+_wlcb_kubeconfig = os.environ.get("WLCB_KUBECONFIG", "")
+if _wlcb_kubeconfig and "wlcb" not in REMOTE_HISTORY_TARGETS:
+    REMOTE_HISTORY_TARGETS["wlcb"] = {
+        **_DEFAULT_REMOTE_TARGET, "kubeconfig": _wlcb_kubeconfig,
+    }
+if REMOTE_HISTORY_TARGETS:
+    log.info(f"远程 history 代理目标: {sorted(REMOTE_HISTORY_TARGETS)}")
+
+_REMOTE_CLIENTS: dict[str, k8s_client.CoreV1Api] = {}
+_REMOTE_CLIENTS_LOCK = threading.Lock()
+_REMOTE_KEY_CACHE: dict[tuple, tuple] = {}
+_REMOTE_KEY_TTL = 60  # 秒
+
+
+def _remote_core_api(target: dict) -> k8s_client.CoreV1Api:
+    """按 kubeconfig 建/取（带缓存）目标集群 CoreV1Api。"""
+    path = target.get("kubeconfig") or ""
+    if not path:
+        raise RuntimeError("目标未配置 kubeconfig")
+    with _REMOTE_CLIENTS_LOCK:
+        core = _REMOTE_CLIENTS.get(path)
+        if core is None:
+            cfg = k8s_client.Configuration()
+            k8s_config.load_kube_config(config_file=path, client_configuration=cfg)
+            core = k8s_client.CoreV1Api(k8s_client.ApiClient(cfg))
+            _REMOTE_CLIENTS[path] = core
+        return core
+
+
+def _remote_api_key(core: k8s_client.CoreV1Api, target: dict) -> str:
+    """取 resource-api 的应用层 api-key：优先配置里的 api_key，否则读 Secret。"""
+    if target.get("api_key"):
+        return target["api_key"]
+    secret_name = target.get("api_key_secret", "api-keys")
+    ns = target.get("namespace", "arc-system")
+    caller = target.get("api_key_caller", "external-history-reader")
+    cache_key = (ns, secret_name, caller)
+    now = time.monotonic()
+    cached = _REMOTE_KEY_CACHE.get(cache_key)
+    if cached and now - cached[1] < _REMOTE_KEY_TTL:
+        return cached[0]
+
+    secret = core.read_namespaced_secret(secret_name, ns)
+    raw = (secret.data or {}).get("keys.json", "")
+    keys = json.loads(base64.b64decode(raw).decode()) if raw else {}
+    key = ""
+    for k, v in keys.items():
+        if (v.get("caller") if isinstance(v, dict) else v) == caller:
+            key = k
+            break
+    if not key:  # 回退：任一带 envs:read 或 * 的 key
+        for k, v in keys.items():
+            scopes = v.get("scopes", []) if isinstance(v, dict) else ["*"]
+            if "*" in scopes or "envs:read" in scopes:
+                key = k
+                break
+    if not key:
+        raise RuntimeError(f"Secret {ns}/{secret_name} 中未找到可用 api-key")
+
+    _REMOTE_KEY_CACHE[cache_key] = (key, now)
+    return key
+
+
+def _remote_history_request(target: dict, path: str, query: dict) -> tuple[int, str]:
+    """经 pods/portforward 隧道向目标 resource-api 发一个 GET，返回 (status, body)。"""
+    core = _remote_core_api(target)
+    ns = target.get("namespace", "arc-system")
+    label = target.get("label_selector", "app=resource-api")
+    port = int(target.get("port", 8080))
+
+    pods = core.list_namespaced_pod(ns, label_selector=label)
+    ready_pods = []
+    for p in pods.items:
+        st = p.status
+        if not st or st.phase != "Running":
+            continue
+        statuses = st.container_statuses or []
+        # Running 且所有容器就绪，避免选到刚拉起/未就绪的副本
+        if statuses and all(cs.ready for cs in statuses):
+            ready_pods.append(p)
+    if not ready_pods:
+        raise RuntimeError(f"{ns} 下没有 Running 且就绪的 {label} pod")
+    pod = ready_pods[0].metadata.name
+
+    key = _remote_api_key(core, target)
+    qs = urlencode(
+        {k: v for k, v in query.items() if v not in (None, "", [])}, doseq=True
+    )
+    req_path = path + ("?" + qs if qs else "")
+
+    pf = portforward(
+        core.connect_get_namespaced_pod_portforward,
+        pod, ns, ports=str(port), _preload_content=False,
+    )
+    try:
+        sock = pf.socket(port)
+        request = (
+            f"GET {req_path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {key}\r\n"
+            f"Accept: application/json\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        sock.sendall(request.encode())
+        chunks = []
+        while True:
+            try:
+                data = sock.recv(65536)
+            except Exception:
+                break
+            if not data:
+                break
+            chunks.append(data)
+        sock.close()
+    finally:
+        try:
+            pf.close()
+        except Exception:
+            pass
+
+    raw = b"".join(chunks)
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = 502
+    parts = head.split(b"\r\n", 1)[0].split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        status = int(parts[1])
+    return status, body.decode(errors="replace")
 
 
 # ──────────────────────────────────────────────────────────
@@ -2009,6 +2178,63 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _remote_history(self, cluster, params):
+        """把目标集群 resource-api 的 /api/v1/envs/history 原样返回。"""
+        target = REMOTE_HISTORY_TARGETS.get(cluster)
+        if not target:
+            return self._err(f"未配置远程集群: {cluster}", 404)
+
+        token = target.get("access_token", "")
+        if token:
+            provided = self.headers.get("X-Auth-Token") or params.get("token", [""])[0]
+            if provided != token:
+                return self._err("invalid or missing token", 401)
+
+        st_str = params.get("start_time", [None])[0]
+        et_str = params.get("end_time",   [None])[0]
+        if not st_str or not et_str:
+            return self._err("start_time 和 end_time 为必填参数，格式: 2026-06-10T00:00:00Z")
+
+        start_time = parse_iso(st_str)
+        end_time   = parse_iso(et_str)
+        if not start_time or not end_time:
+            return self._err("时间格式不合法，请使用 ISO 8601 格式")
+        if start_time > end_time:
+            return self._err("start_time 不能晚于 end_time")
+
+        match_mode = params.get("match_mode", ["created"])[0]
+        if match_mode not in ("created", "released", "overlap"):
+            return self._err("match_mode 取值: created / released / overlap")
+
+        query = {"start_time": st_str, "end_time": et_str, "match_mode": match_mode}
+        if params.get("name_prefix"):
+            query["name_prefix"] = params["name_prefix"][0]
+        if params.get("status"):
+            query["status"] = params["status"]
+        if params.get("limit"):
+            query["limit"] = params["limit"][0]
+        if params.get("offset"):
+            query["offset"] = params["offset"][0]
+
+        try:
+            status, body = _remote_history_request(
+                target, "/api/v1/envs/history", query
+            )
+        except Exception as e:
+            log.error(f"远程 history 请求失败 [{cluster}]: {e}")
+            return self._ok(
+                {"error": f"upstream unavailable: {e}", "count": 0, "envs": []}, 502
+            )
+
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            return self._ok(
+                {"error": "upstream returned non-JSON", "raw": body[:2000]},
+                502 if status >= 500 else status,
+            )
+        return self._ok(data, status)
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -2045,6 +2271,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err("start_time 不能晚于 end_time")
             snapshots = query_capacity(start_time, end_time, cluster_filter)
             return self._ok({"count": len(snapshots), "snapshots": snapshots})
+
+        # 远程集群代理：/api/v1/envs/history/<cluster>（atomgit 除外，见下）
+        if path.startswith("/api/v1/envs/history/"):
+            remote_cluster = path[len("/api/v1/envs/history/"):]
+            if remote_cluster and remote_cluster != "atomgit":
+                return self._remote_history(remote_cluster, params)
 
         if path in ("/api/v1/envs/history", "/api/v1/envs/history/atomgit"):
             st_str = params.get("start_time", [None])[0]

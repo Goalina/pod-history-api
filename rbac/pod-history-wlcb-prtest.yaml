@@ -1,0 +1,34 @@
+# pod-history-api 远程 history 代理专用凭证（wlcb 侧 RBAC）
+# subject: ServiceAccount arc-system/pod-history-wlcb-prtest
+# 生成该 SA 的 kubeconfig 后存入 Vault，供 pod-history-api 经 pods/portforward
+# 访问 arc-system/resource-api 的 /api/v1/envs/history。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-history-wlcb-prtest
+  namespace: arc-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]            # 按 label 定位 Running 的 resource-api pod
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["get", "create"]          # 建隧道访问 resource-api（本集群握手校验 get）
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["api-keys"]       # 读 resource-api 应用层 api-key
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-history-wlcb-prtest
+  namespace: arc-system
+subjects:
+  - kind: ServiceAccount
+    name: pod-history-wlcb-prtest
+    namespace: arc-system
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: pod-history-wlcb-prtest
