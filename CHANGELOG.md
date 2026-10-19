@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
+- AtomGit CI 的 `extend_env_comments` 新增 `pr_number`、`pr_head_sha` 两个字段，分别取自 Pod annotation `octopus.io/pc-pr-number`、`octopus.io/pc-pr-head-sha`
 - 新增远程集群 history 代理接口 `GET /api/v1/envs/history/<cluster>`（如 `/api/v1/envs/history/wlcb`）：把目标集群 `resource-api`（resource-deploy-core 3.8.1）的 `/api/v1/envs/history` 原样返回，参数（`start_time`/`end_time`/`match_mode`/`status`/`name_prefix`/`limit`/`offset`）透传，响应保持上游 `count`/`envs` 结构
   - 适用场景：api 模式的 Pod 与目标集群之间只有 apiserver 可达，且 apiserver 的 service-proxy 会消耗 `Authorization` 头，无法把 resource-api 的应用层 api-key 透传过去
   - 实现：用目标集群 kubeconfig 经 apiserver 建 `pods/portforward` 原始 TCP 隧道，在隧道内自行构造带 `Authorization` 的 HTTP 请求；不 exec、不改动目标集群工作负载

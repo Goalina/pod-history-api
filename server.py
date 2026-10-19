@@ -762,6 +762,8 @@ _OCTOPUS_ANNOTATION_MAP = {
     "octopus.io/job-name":            "job_display_name",
     "octopus.io/job-external-id":     "job_external_id",
     "octopus.io/project-id":          "project_id",
+    "octopus.io/pc-pr-number":        "pr_number",
+    "octopus.io/pc-pr-head-sha":      "pr_head_sha",
 }
 
 

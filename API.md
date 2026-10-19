@@ -308,7 +308,7 @@ start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
 | `organization` | string | `my-org` | 所属 GitHub 组织 |
 | `repository` | string | `my-org/my-repo` | 所属 GitHub 仓库（含组织前缀） |
 
-- **子字段（`source=atomgit-action`）：** 取自 Pod 的 `octopus.io/` 前缀 annotation，共 9 个字段
+- **子字段（`source=atomgit-action`）：** 取自 Pod 的 `octopus.io/` 前缀 annotation，共 11 个字段
 
 | 字段 | 类型 | 示例 | 来源 annotation |
 |---|---|---|---|
@@ -321,6 +321,8 @@ start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
 | `job_display_name` | string | `UT-pool` | `octopus.io/job-name` |
 | `job_external_id` | string | `478fde37728142028a315aadb30fc4a5` | `octopus.io/job-external-id` |
 | `project_id` | string | `bf93426ae91d46a5b21f59aa60d83c3e` | `octopus.io/project-id` |
+| `pr_number` | string | `48165` | `octopus.io/pc-pr-number` |
+| `pr_head_sha` | string | `26d5adb1f638ab41e782c1a8496220dc508d78c9` | `octopus.io/pc-pr-head-sha` |
 
 > 仅非空字段会出现，不同 Pod 返回的字段子集可能不同。
 
