@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 - 新增 AtomGit CI pod 的 `extend_env_comments` 提取：直接从 `octopus.io/` 前缀 annotation 读取 9 个字段（`repository`、`organization`、`repository_url`、`workflow_ref`、`pipeline_id`、`pipeline_run_id`、`job_display_name`、`job_external_id`、`project_id`），无需额外 K8s API 调用
 - 新增路由 `GET /api/v1/envs/history/atomgit`：固定只返回 `source=atomgit-action` 的记录，参数与原路由完全一致，不影响原有接口行为
 - `/atomgit` 路由支持分页：`limit`（默认 1000，范围 1~5000）+ `offset`（默认 0），响应新增 `total`（满足条件的总条数）、`limit`、`offset` 字段。主路由不分页，行为保持不变
+- 新增 sh-001 / sh-002 集群 collector（Vault key `sh001` / `sh002`），使用只读 ServiceAccount kubeconfig 采集 Pod 与卡数快照
 
 ### Changed
 - `/atomgit` 分页**去掉 `total` 字段**：原实现每次请求都跑 `SELECT COUNT(*)` 算总数，需回表扫描全部命中行，在 120 万行表上月份区间要十几秒，且与 `limit` 无关——导致「取 1 条」和「取 1000 条」一样慢。现只做 SQL 层 `LIMIT/OFFSET`，响应为 `count`/`limit`/`offset`/`envs`，翻页以「本页 `count < limit`」判断。主路由行为不变

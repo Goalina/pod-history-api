@@ -150,7 +150,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: api
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           ports:
             - name: http
@@ -223,7 +223,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -283,7 +283,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -353,7 +353,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -423,7 +423,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -493,7 +493,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -563,7 +563,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -633,7 +633,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -703,7 +703,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -773,7 +773,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -843,7 +843,7 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: collector
-          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261012-1724
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
           imagePullPolicy: Always
           env:
             - name: MODE
@@ -852,6 +852,146 @@ spec:
               value: "cn12-001"
             - name: KUBECONFIG_PATH
               value: "/vault/secrets/cn12.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+      volumes:
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: sh-001 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-sh-001
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-sh-001
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-sh001.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-sh001.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-sh001.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.sh001 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-sh-001
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "sh-001"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/sh001.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+      volumes:
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
+# ── Collector: sh-002 (远程集群，Vault 注入 kubeconfig) ─────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-sh-002
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-sh-002
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-sh002.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-sh002.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-sh002.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.sh002 }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-sh-002
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261019-1716
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "sh-002"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/sh002.yaml"
             - name: RETENTION_DAYS
               value: "30"
             - name: DATABASE_URL
