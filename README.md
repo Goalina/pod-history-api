@@ -71,6 +71,7 @@ K8s 集群 Pod 历史记录服务，对外提供符合 [resource-deploy-core](ht
 | `status` | string（多值） | — | 按状态过滤，如 `status=released&status=rejected` |
 | `name_prefix` | string | — | 按 Pod 名称前缀过滤 |
 | `cluster` | string | — | 按集群 ID 过滤 |
+| `source` | string | — | 按来源过滤，如 `source=buildkite`（取值 `github-action` / `atomgit-action` / `buildkite` / `unknown`），不传返回全部来源 |
 
 **`match_mode` 说明：**
 
@@ -161,7 +162,7 @@ K8s 集群 Pod 历史记录服务，对外提供符合 [resource-deploy-core](ht
 | `duration` | string | 格式化运行时长（如 `"2h30m"`、`"1d5h4m3s"`、`"30s"`）。已终止 Pod 基于 `ttl_seconds`；运行中 Pod 由 API 实时计算，每次查询可能不同 |
 | `wait_duration` | string | 从 Pod 创建到容器开始运行的等待时长（Pending 阶段耗时），反映调度和镜像拉取耗时，如 `"5s"`、`"2m10s"` |
 | `groups` | object | 以 namespace 为维度的分组，格式 `{"<namespace>": {"device_count": <容器数量>}}` |
-| `extend_env_comments` | object | 扩展信息，当前用于 GitHub Actions 工作流关联数据，详见下方 |
+| `extend_env_comments` | object | 扩展信息，用于关联 CI 工作流数据，字段结构取决于 `source`（GitHub Actions / AtomGit / Buildkite），详见下方 |
 | `resource_summary` | object | Pod 资源请求摘要，取自容器 `resources.requests`（无则回退到 limits），详见下方 |
 | `node_ip` | string | Pod 所在节点 IP |
 | `npu_list` | array of string | Pod 使用的 NPU 物理卡号列表（如 `["0", "1"]`），从 Pod 注解 `huawei.com/AscendReal` 解析，无 NPU 时为空数组 |
@@ -194,6 +195,8 @@ K8s 集群 Pod 历史记录服务，对外提供符合 [resource-deploy-core](ht
 | `repository` | 所属 GitHub 仓库 |
 
 > 以上字段仅非空时才会出现，不同 Pod 返回的字段可能不同。
+>
+> `source=atomgit-action`（AtomGit CI）与 `source=buildkite`（Buildkite CI，如 vllm-project 的 `vllm-omni-npu-ci`）有各自的字段集，直接从对应前缀的 annotation/label 提取，详见 [API.md](./API.md) 的 `extend_env_comments` 章节。
 
 ##### `resource_summary` 字段
 

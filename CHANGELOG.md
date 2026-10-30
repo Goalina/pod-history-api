@@ -7,7 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
-- 新增 `source=buildkite`：识别 Buildkite（`agent-stack-k8s`）拉起的 CI Pod（判据：`buildkite.com/job-uuid` label 或 `buildkite.com/pipeline-slug` annotation，如 vllm-project 的 `vllm-omni-npu-ci`），从 Pod annotation/label 提取构建元数据写入 `extend_env_comments`：`pipeline_slug`/`build_url`/`build_number`（从 build-url 的 `/builds/<n>` 解析）/`build_branch`/`repository`/`job_url`/`job_priority`/`job_uuid`/`controller_id`/`queue`/`resource_class`，无需额外 K8s API 调用。复用现有接口与字段，不新增路由/列
+- 新增 `source=buildkite`：识别 Buildkite（`agent-stack-k8s`）拉起的 CI Pod（判据：`buildkite.com/job-uuid` label 或 `buildkite.com/pipeline-slug` annotation，如 vllm-project 的 `vllm-omni-npu-ci`），从 Pod annotation/label 提取构建元数据写入 `extend_env_comments`：`pipeline_slug`/`build_url`/`build_number`（从 build-url 的 `/builds/<n>` 解析）/`build_branch`/`repository_url`（完整 git URL，与 atomgit 的 `repository_url` 语义一致）/`job_url`/`job_priority`/`job_uuid`/`controller_id`/`queue`/`resource_class`，无需额外 K8s API 调用。复用现有接口与字段，不新增路由/列
+- 主路由 `GET /api/v1/envs/history` 新增可选 `source` 查询参数（如 `?source=buildkite`），按来源在 SQL 层过滤（复用 `idx_source` 索引），不传则返回全部来源（行为不变）；避免调用方只能拉全量后自行过滤
 - AtomGit CI 的 `extend_env_comments` 新增 `pr_number`、`pr_head_sha` 两个字段，分别取自 Pod annotation `octopus.io/pc-pr-number`、`octopus.io/pc-pr-head-sha`
 - 新增远程集群 history 代理接口 `GET /api/v1/envs/history/<cluster>`（如 `/api/v1/envs/history/wlcb`）：把目标集群 `resource-api`（resource-deploy-core 3.8.1）的 `/api/v1/envs/history` 原样返回，参数（`start_time`/`end_time`/`match_mode`/`status`/`name_prefix`/`limit`/`offset`）透传，响应保持上游 `count`/`envs` 结构
   - 适用场景：api 模式的 Pod 与目标集群之间只有 apiserver 可达，且 apiserver 的 service-proxy 会消耗 `Authorization` 头，无法把 resource-api 的应用层 api-key 透传过去
