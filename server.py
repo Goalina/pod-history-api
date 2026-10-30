@@ -766,6 +766,22 @@ _OCTOPUS_ANNOTATION_MAP = {
     "octopus.io/pc-pr-head-sha":      "pr_head_sha",
 }
 
+# Buildkite（agent-stack-k8s）CI pod 的构建元数据：直接从 Pod annotation/label 读，无需额外 K8s API
+_BUILDKITE_ANNOTATION_MAP = {
+    "buildkite.com/pipeline-slug": "pipeline_slug",
+    "buildkite.com/build-url":     "build_url",
+    "buildkite.com/build-branch":  "build_branch",
+    "buildkite.com/build-repo":    "repository",
+    "buildkite.com/job-url":       "job_url",
+    "buildkite.com/job-priority":  "job_priority",
+}
+_BUILDKITE_LABEL_MAP = {
+    "buildkite.com/job-uuid":           "job_uuid",
+    "buildkite.com/controller-id":      "controller_id",
+    "tag.buildkite.com/queue":          "queue",
+    "tag.buildkite.com/resource_class": "resource_class",
+}
+
 
 def _parse_npu(reqs):
     for key, val in (reqs or {}).items():
@@ -952,6 +968,8 @@ def _extract_record(pod) -> dict | None:
         source = "atomgit-action"
     elif labels.get("actions-ephemeral-runner") == "True" or labels.get("runner-pod"):
         source = "github-action"
+    elif labels.get("buildkite.com/job-uuid") or annotations.get("buildkite.com/pipeline-slug"):
+        source = "buildkite"
     else:
         source = "unknown"
 
@@ -964,6 +982,21 @@ def _extract_record(pod) -> dict | None:
             if annotations.get(k)
         }
         log.info(f"  AtomGit CI pod {meta.name}: job={extend_env_comments.get('job_display_name', '')}")
+    elif source == "buildkite":
+        # Buildkite CI pod 直接从 annotation/label 读构建元数据
+        extend_env_comments = {
+            v: annotations[k]
+            for k, v in _BUILDKITE_ANNOTATION_MAP.items()
+            if annotations.get(k)
+        }
+        for k, v in _BUILDKITE_LABEL_MAP.items():
+            if labels.get(k):
+                extend_env_comments[v] = labels[k]
+        # build_number 无独立字段，从 build-url 的 /builds/<n> 解析
+        burl = annotations.get("buildkite.com/build-url", "")
+        if "/builds/" in burl:
+            extend_env_comments["build_number"] = burl.rsplit("/builds/", 1)[1].split("/")[0].split("?")[0]
+        log.info(f"  Buildkite pod {meta.name}: pipeline={extend_env_comments.get('pipeline_slug', '')} build={extend_env_comments.get('build_number', '')}")
     else:
         extend_env_comments = {}
         if meta.name.endswith("-workflow") and _k8s_custom:
