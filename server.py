@@ -766,6 +766,24 @@ _OCTOPUS_ANNOTATION_MAP = {
     "octopus.io/pc-pr-head-sha":      "pr_head_sha",
 }
 
+# Buildkite（agent-stack-k8s）CI pod 的构建元数据：直接从 Pod annotation/label 读，无需额外 K8s API
+_BUILDKITE_ANNOTATION_MAP = {
+    "buildkite.com/pipeline-slug": "pipeline_slug",
+    "buildkite.com/build-url":     "build_url",
+    "buildkite.com/build-branch":  "build_branch",
+    # build-repo 是完整 git URL（如 https://github.com/vllm-project/vllm-omni.git），
+    # 与 atomgit 的 repository_url 语义一致；不派生 owner/repo 短形式（SSH / GitLab 子组等无法 100% 可靠解析）
+    "buildkite.com/build-repo":    "repository_url",
+    "buildkite.com/job-url":       "job_url",
+    "buildkite.com/job-priority":  "job_priority",
+}
+_BUILDKITE_LABEL_MAP = {
+    "buildkite.com/job-uuid":           "job_uuid",
+    "buildkite.com/controller-id":      "controller_id",
+    "tag.buildkite.com/queue":          "queue",
+    "tag.buildkite.com/resource_class": "resource_class",
+}
+
 
 def _parse_npu(reqs):
     for key, val in (reqs or {}).items():
@@ -952,6 +970,8 @@ def _extract_record(pod) -> dict | None:
         source = "atomgit-action"
     elif labels.get("actions-ephemeral-runner") == "True" or labels.get("runner-pod"):
         source = "github-action"
+    elif labels.get("buildkite.com/job-uuid") or annotations.get("buildkite.com/pipeline-slug"):
+        source = "buildkite"
     else:
         source = "unknown"
 
@@ -964,6 +984,21 @@ def _extract_record(pod) -> dict | None:
             if annotations.get(k)
         }
         log.info(f"  AtomGit CI pod {meta.name}: job={extend_env_comments.get('job_display_name', '')}")
+    elif source == "buildkite":
+        # Buildkite CI pod 直接从 annotation/label 读构建元数据
+        extend_env_comments = {
+            v: annotations[k]
+            for k, v in _BUILDKITE_ANNOTATION_MAP.items()
+            if annotations.get(k)
+        }
+        for k, v in _BUILDKITE_LABEL_MAP.items():
+            if labels.get(k):
+                extend_env_comments[v] = labels[k]
+        # build_number 无独立字段，从 build-url 的 /builds/<n> 解析
+        burl = annotations.get("buildkite.com/build-url", "")
+        if "/builds/" in burl:
+            extend_env_comments["build_number"] = burl.rsplit("/builds/", 1)[1].split("/")[0].split("?")[0]
+        log.info(f"  Buildkite pod {meta.name}: pipeline={extend_env_comments.get('pipeline_slug', '')} build={extend_env_comments.get('build_number', '')}")
     else:
         extend_env_comments = {}
         if meta.name.endswith("-workflow") and _k8s_custom:
@@ -1822,6 +1857,9 @@ def _sync_worker_pods():
             )
             workers = cur.fetchall()
             # 取所有同 cluster 有工作流信息的 job pod（不限 namespace，不限 -workflow 后缀）
+            # TODO(buildkite): 目前 buildkite job pod 是 batch/v1 Job，不会拉起多机 worker，故不在候选内。
+            #   若将来 buildkite 任务也经 LWS/Volcano 拉多机 worker，需把 'buildkite' 加入 source IN 列表，
+            #   worker 才能继承 buildkite 的 extend_env_comments。
             cur.execute(
                 "SELECT env_id, name, created_at, expires_at, source, extend_env_comments "
                 "FROM pod_history "
@@ -2320,8 +2358,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err("match_mode 取值: created / released / overlap")
 
             is_atomgit = path.endswith("/atomgit")
-            # /atomgit 路由固定只返回 atomgit-action 来源的记录
-            source_filter = "atomgit-action" if is_atomgit else None
+            # /atomgit 路由固定只返回 atomgit-action 来源的记录；
+            # 主路由支持可选 ?source= 过滤（如 source=buildkite），不传则返回全部来源（行为不变）
+            source_filter = "atomgit-action" if is_atomgit else params.get("source", [None])[0]
 
             # 仅 /atomgit 路由支持分页；主路由保持原有全量返回行为不变
             limit = offset = None

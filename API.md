@@ -6,7 +6,7 @@
 
 | 路由 | 查询范围 | 分页 | 适用场景 |
 |---|---|---|---|
-| `GET /api/v1/envs/history` | **全部来源**的 Pod（`github-action` / `atomgit-action` / `unknown`） | ❌ 一次性全量返回 | 跨来源统计、NPU 占用汇总、兼容历史调用方 |
+| `GET /api/v1/envs/history` | **全部来源**的 Pod（`github-action` / `atomgit-action` / `buildkite` / `unknown`），可选 `?source=` 过滤单一来源 | ❌ 一次性全量返回 | 跨来源统计、NPU 占用汇总、兼容历史调用方 |
 | `GET /api/v1/envs/history/atomgit` | **仅 AtomGit CI**（`source=atomgit-action`）拉起的 Pod | ✅ `limit`/`offset` 分页 | 只关心 AtomGit CI 任务、数据量大需翻页 |
 | `GET /api/v1/envs/history/<cluster>` | **远程代理**：目标集群 `resource-api` 的 env 历史（如 `wlcb`） | 由上游决定（透传 `limit`/`offset`） | 查询由 resource-api 管理、本服务未采集的集群历史 |
 | `GET /api/v1/clusters/capacity` | 各集群加速卡 **总/已用/可用**（含节点级明细） | ❌ | 集群卡数总览与趋势 |
@@ -14,7 +14,7 @@
 
 两个路由共享同一套过滤参数（`start_time` / `end_time` / `match_mode` / `status` / `name_prefix` / `cluster`），下方「请求参数」章节通用。差异仅两点：
 
-1. `/atomgit` 在过滤条件上**额外固定** `source = atomgit-action`，调用方无需也无法传 `source`。
+1. `source` 过滤：主路由支持可选 `?source=`（如 `source=buildkite`），不传则返回全部来源；`/atomgit` 在过滤条件上**额外固定** `source = atomgit-action`，调用方无需也无法传 `source`。
 2. `/atomgit` **支持分页**且响应多出 `limit` / `offset` 两个字段；主路由不分页、响应只有 `count` / `envs`。
 
 ### 两个路由的输入输出对照
@@ -22,7 +22,7 @@
 | | `GET /api/v1/envs/history` | `GET /api/v1/envs/history/atomgit` |
 |---|---|---|
 | **必填输入** | `start_time`、`end_time` | 同左 |
-| **可选输入** | `match_mode`、`status`、`name_prefix`、`cluster` | 同左，外加 `limit`、`offset` |
+| **可选输入** | `match_mode`、`status`、`name_prefix`、`cluster`、`source` | 同左（但 `source` 固定为 `atomgit-action`），外加 `limit`、`offset` |
 | **返回范围** | 全部来源 | 仅 `atomgit-action` |
 | **是否分页** | 否，返回时间窗口内全部记录 | 是，默认每页 1000 条 |
 | **输出顶层字段** | `count`、`envs` | `count`、`limit`、`offset`、`envs` |
@@ -99,6 +99,7 @@ start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
 | `status` | string（可多值） | — | `status=released&status=rejected` | 按状态过滤 |
 | `name_prefix` | string | — | `my-job-` | 按 Pod 名称前缀过滤 |
 | `cluster` | string | — | `gy006` | 按集群 ID 过滤 |
+| `source` | string | — | `buildkite` | 按来源过滤（`github-action` / `atomgit-action` / `buildkite` / `unknown`），不传返回全部来源 |
 
 **`match_mode` 取值**
 
@@ -324,6 +325,22 @@ start_time=2026-09-20T00:00:00Z&end_time=2026-09-20T23:59:59Z&cluster=wlcb-001"
 | `pr_number` | string | `48165` | `octopus.io/pc-pr-number` |
 | `pr_head_sha` | string | `26d5adb1f638ab41e782c1a8496220dc508d78c9` | `octopus.io/pc-pr-head-sha` |
 
+- **子字段（`source=buildkite`）：** 取自 Pod 的 `buildkite.com/` 前缀 annotation 与 label，直接提取无需额外 K8s API
+
+| 字段 | 类型 | 示例 | 来源 |
+|---|---|---|---|
+| `pipeline_slug` | string | `vllm-omni-npu-ci` | annotation `buildkite.com/pipeline-slug` |
+| `build_url` | string | `https://buildkite.com/vllm/vllm-omni-npu-ci/builds/10236` | annotation `buildkite.com/build-url` |
+| `build_number` | string | `10236` | 从 `build-url` 的 `/builds/<n>` 解析 |
+| `build_branch` | string | `ischencheng:perf/qwen3-omni-mixed-handoff` | annotation `buildkite.com/build-branch`（可为 `fork:branch` 或 `main`） |
+| `repository_url` | string | `https://github.com/vllm-project/vllm-omni.git` | annotation `buildkite.com/build-repo`（完整 git URL，语义同上方 `repository_url`） |
+| `job_url` | string | `https://buildkite.com/vllm/vllm-omni-npu-ci/builds/10236#01a18a84-…` | annotation `buildkite.com/job-url` |
+| `job_priority` | string | `0` | annotation `buildkite.com/job-priority` |
+| `job_uuid` | string | `01a18a84-9166-47fd-9fe0-f13e70062bde` | label `buildkite.com/job-uuid` |
+| `controller_id` | string | `linux-aarch64-a3-agent-stack-k8s` | label `buildkite.com/controller-id` |
+| `queue` | string | `ascend-a3` | label `tag.buildkite.com/queue` |
+| `resource_class` | string | `npu-2` | label `tag.buildkite.com/resource_class` |
+
 > 仅非空字段会出现，不同 Pod 返回的字段子集可能不同。
 
 **拼接 GitHub URL：**
@@ -415,16 +432,17 @@ function buildGithubUrls(comments) {
 #### `envs[].source`
 
 - **类型：** string
-- **取值：** `github-action` | `atomgit-action` | `unknown`
+- **取值：** `github-action` | `atomgit-action` | `buildkite` | `unknown`
 - **说明：** Pod 的来源类型，采集时按 label/annotation 判断，不依赖 Pod 名字
 
 | 值 | 判断依据 | 含义 |
 |---|---|---|
 | `github-action` | Pod 带 `actions-ephemeral-runner: "True"` label（runner pod）或 `runner-pod` label（workflow pod） | GitHub Actions ARC 拉起 |
 | `atomgit-action` | Pod 带 `octopus.io/job-run-id` annotation | AtomGit CI 拉起 |
+| `buildkite` | Pod 带 `buildkite.com/job-uuid` label 或 `buildkite.com/pipeline-slug` annotation | Buildkite（agent-stack-k8s）CI 拉起 |
 | `unknown` | 以上均不匹配 | 来源无法识别 |
 
-> `atomgit-action` 类型的 Pod，其 `extend_env_comments` 直接从 `octopus.io/` 前缀 annotation 提取（见下方 `extend_env_comments` 的 AtomGit 字段）。
+> `atomgit-action` / `buildkite` 类型的 Pod，其 `extend_env_comments` 直接从对应前缀的 annotation/label 提取（见上方 `extend_env_comments` 的 AtomGit / Buildkite 字段）。
 >
 > 多机 CI 的 worker pod（LWS、Volcano Job 等，本身不带 CI label/annotation）会由采集器关联到其来源 job pod，`source` 随之继承为 `github-action` / `atomgit-action`；关联不唯一时保持 `unknown`。
 
