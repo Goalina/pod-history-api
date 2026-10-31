@@ -296,6 +296,7 @@ curl "http://localhost:18080/api/v1/envs/history?start_time=2026-07-01T00:00:00Z
 | `CAPACITY_INTERVAL` | `300` | 集群卡数快照采集/对齐粒度（秒），`snapshot_time` 对齐到其整数倍 |
 | `REMOTE_HISTORY_TARGETS` | — | 远程集群代理目标（JSON，key=集群标识，见 `GET /api/v1/envs/history/<cluster>`）；仅 api 模式使用 |
 | `WLCB_KUBECONFIG` | — | `REMOTE_HISTORY_TARGETS` 的简写：自动注册 `wlcb` 目标，值为其 kubeconfig 路径 |
+| `WLCB_API_KEY_CALLER` | `external-history-reader` | `WLCB_KUBECONFIG` 简写注册的 `wlcb` 目标使用的 api-key caller；同 caller 多把 key 时优先最小权限的 `envs:read` key |
 | `REMOTE_HISTORY_TIMEOUT` | `30` | 远程代理隧道 socket 读写超时（秒） |
 
 ---

@@ -58,6 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
   - 拿不到迁移锁时校验 `pod_history` 必需列是否齐全：缺列则快速失败重启重试，避免带缺列对外服务；迁移在 autocommit 下逐条提交、非原子，要求所有迁移语句幂等
 
 ### Fixed
+- 远程集群 history 代理的 api-key 选择改为同 caller 下优先最小权限 key（优先 `envs:read` 且无 `*`/写权限），避免误选同 caller 的 `*` 全权限 key；新增 `WLCB_API_KEY_CALLER` 覆盖 wlcb 简写的 caller，wlcb 改为使用 `octopus-scheduler` caller 下的只读 key
 - 集群卡数快照排除 Liqo 虚拟节点：跳过带 `liqo.io/type=virtual-node` 标签的节点（如 hk-001 里的 `gy001`/`sz-lab`/`wlcb001`），不再把虚拟节点卡数计入 total/used（原先 hk-001 虚高 152/256 卡）
 - 修复集群卡数快照桶漂移：`_capacity_loop` 原为「采集后 `sleep(CAPACITY_INTERVAL)`」，而采集本身耗时（`list nodes` + `list pods`，实测约 40s）会叠加到周期上，导致每轮相位漂移、约每 7~8 轮**跳过整个 bucket**（实测 gy-001/hk-001 丢了 09:00 桶）。改为**先睡到下一个整 bucket 边界再采集**（`_next_capacity_sleep`），保证每轮恰好前进一个 bucket；且首轮即对齐，消除启动相位随机导致的错标/跳桶
 - 修复迁移在繁忙大表上 crashloop：`ALTER TABLE ADD COLUMN IF NOT EXISTS` 即使列已存在也要先拿 `ACCESS EXCLUSIVE` 锁，之前设的 `lock_timeout=15s` 在生产 121 万行表上拿不到锁即超时失败（致命）→ 新 pod 反复重启。改为先 `_schema_ready` 校验，列已齐全则完全跳过 DDL（不再加锁），仅缺列时才执行且不设 `lock_timeout`（等待而非超时崩溃）
