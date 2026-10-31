@@ -140,10 +140,12 @@ if _remote_raw:
     except Exception as _e:
         log.error(f"REMOTE_HISTORY_TARGETS 解析失败，已忽略: {_e}")
 _wlcb_kubeconfig = os.environ.get("WLCB_KUBECONFIG", "")
+_wlcb_caller = os.environ.get("WLCB_API_KEY_CALLER", "")
 if _wlcb_kubeconfig and "wlcb" not in REMOTE_HISTORY_TARGETS:
-    REMOTE_HISTORY_TARGETS["wlcb"] = {
-        **_DEFAULT_REMOTE_TARGET, "kubeconfig": _wlcb_kubeconfig,
-    }
+    _wlcb_target = {**_DEFAULT_REMOTE_TARGET, "kubeconfig": _wlcb_kubeconfig}
+    if _wlcb_caller:
+        _wlcb_target["api_key_caller"] = _wlcb_caller
+    REMOTE_HISTORY_TARGETS["wlcb"] = _wlcb_target
 if REMOTE_HISTORY_TARGETS:
     log.info(f"远程 history 代理目标: {sorted(REMOTE_HISTORY_TARGETS)}")
 
@@ -174,6 +176,43 @@ def _remote_core_api(target: dict) -> k8s_client.CoreV1Api:
         return core
 
 
+def _api_key_scopes(v) -> list:
+    return v.get("scopes", []) if isinstance(v, dict) else ["*"]
+
+
+def _api_key_rank(v):
+    """同 caller 多把 key 时的优先级：优先 envs:read 只读，避免误用 * 全权限 key。"""
+    scopes = set(_api_key_scopes(v))
+    wildcard = "*" in scopes
+    writes = any(str(s).endswith(":write") for s in scopes)
+    env_read = "envs:read" in scopes
+    if env_read and not wildcard and not writes:
+        tier = 0
+    elif not wildcard and not writes:
+        tier = 1
+    else:
+        tier = 2
+    return (tier, len(scopes))
+
+
+def _select_api_key(keys: dict, caller: str) -> str:
+    matches = [
+        (k, v) for k, v in keys.items()
+        if (v.get("caller") if isinstance(v, dict) else v) == caller
+    ]
+    if matches:
+        return sorted(matches, key=lambda kv: _api_key_rank(kv[1]))[0][0]
+
+    # 回退：任一带 envs:read 或 * 的 key，同样按最小权限排序
+    fallback = [
+        (k, v) for k, v in keys.items()
+        if "*" in _api_key_scopes(v) or "envs:read" in _api_key_scopes(v)
+    ]
+    if fallback:
+        return sorted(fallback, key=lambda kv: _api_key_rank(kv[1]))[0][0]
+    return ""
+
+
 def _remote_api_key(core: k8s_client.CoreV1Api, target: dict) -> str:
     """取 resource-api 的应用层 api-key：优先配置里的 api_key，否则读 Secret。"""
     if target.get("api_key"):
@@ -195,17 +234,7 @@ def _remote_api_key(core: k8s_client.CoreV1Api, target: dict) -> str:
         secret = core.read_namespaced_secret(secret_name, ns)
         raw = (secret.data or {}).get("keys.json", "")
         keys = json.loads(base64.b64decode(raw).decode()) if raw else {}
-        key = ""
-        for k, v in keys.items():
-            if (v.get("caller") if isinstance(v, dict) else v) == caller:
-                key = k
-                break
-        if not key:  # 回退：任一带 envs:read 或 * 的 key
-            for k, v in keys.items():
-                scopes = v.get("scopes", []) if isinstance(v, dict) else ["*"]
-                if "*" in scopes or "envs:read" in scopes:
-                    key = k
-                    break
+        key = _select_api_key(keys, caller)
         if not key:
             raise RuntimeError(f"Secret {ns}/{secret_name} 中未找到可用 api-key")
 

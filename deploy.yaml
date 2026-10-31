@@ -166,6 +166,8 @@ spec:
               value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
             - name: WLCB_KUBECONFIG
               value: "/vault/secrets/wlcb-prtest.yaml"
+            - name: WLCB_API_KEY_CALLER
+              value: "octopus-scheduler"
           resources:
             requests:
               cpu: "500m"
