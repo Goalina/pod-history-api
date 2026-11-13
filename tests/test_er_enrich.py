@@ -171,11 +171,28 @@ class FakeCustomApi:
         return _fake_runners()
 
 
+class FakeCoreApi:
+    """mock _k8s_core：Part B 的 list_node 返回空列表（无虚拟节点，直接返回）"""
+
+    def list_node(self, **kwargs):
+        class R:
+            items = []
+        return R()
+
+    def list_pod_for_all_namespaces(self, **kwargs):
+        class R:
+            items = []
+        return R()
+
+
 def test_sync_runners_normal_mode():
     """普通模式下：runner_map 不含 _creation、不构建 lower bounds"""
     ns = _load_server_ns()
     ns["ER_CROSS_ENRICH_ONLY"] = False
     ns["_k8s_custom"] = FakeCustomApi()
+
+    # mock _k8s_core（避免 Part B 的 list_node 报错打日志）
+    ns["_k8s_core"] = FakeCoreApi()
 
     # mock _cross_enrich 确保不被调用（普通模式不走 enrich）
     called = {"cross": False}
@@ -191,9 +208,10 @@ def test_sync_runners_normal_mode():
     ns["_sync_ephemeral_runners"]()
 
     assert not called["cross"], "normal mode should NOT call cross_enrich"
-    # Part A 的 DB 查询被执行
-    assert len(conn.cur.executed) >= 1 or conn.cur.executed == []
-    print("PASS: 普通模式不调 cross_enrich")
+    # Part A 的 DB 查询被执行（至少有一条 SELECT）
+    select_count = sum(1 for sql, _ in conn.cur.executed if sql and "SELECT" in sql.upper())
+    assert select_count >= 1, f"Part A should execute at least 1 SELECT, got {select_count}"
+    print("PASS: 普通模式不调 cross_enrich，Part A 执行了 SELECT")
 
 
 def test_sync_runners_enrich_mode():
