@@ -1137,6 +1137,85 @@ spec:
             type: CharDevice
 
 ---
+# ── Collector: karmada-cp (ER 跨集群补写，不采集 pod/容量) ──
+# Karmada CP 面持有 EphemeralRunner，job pod 分发到成员集群（sz-lab 等）。
+# 此 Deployment 只周期性查 CP 面的 ER 并按 runner 名补写所有集群的
+# -workflow 记录的 extend_env_comments，不 watch pod（避免与成员集群
+# collector 产生重复记录：Karmada 分发后 CP 面和成员集群的 Pod UID 不同）。
+# 前置：Vault internal/data/ascend/npu-exporter 下已有 karmadacp key
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-karmada-cp
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-karmada-cp
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-karmadacp.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-karmadacp.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-karmadacp.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.karmadacp }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-karmada-cp
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261031-0940
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "karmada-cp"
+            - name: ER_CROSS_ENRICH_ONLY
+              value: "true"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/karmadacp.yaml"
+            - name: RUNNER_SYNC_INTERVAL
+              value: "30"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+
+---
 # ── API Server Service ─────────────────────────────────────
 apiVersion: v1
 kind: Service
