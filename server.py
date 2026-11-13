@@ -42,9 +42,10 @@ MODE            = os.environ.get("MODE", "standalone")
 RUNNER_SYNC_INTERVAL = int(os.environ.get("RUNNER_SYNC_INTERVAL", "30"))
 
 # ER 跨集群补写模式（Karmada CP 用）：只查本面 EphemeralRunner 并按 runner 名
-# 补写所有集群的 -workflow 记录；不 watch pod、不采集容量（避免与成员集群
-# collector 产生重复记录：Karmada 分发后 CP 面和成员集群的 Pod UID 不同）。
-ER_CROSS_ENRICH_ONLY = os.environ.get("ER_CROSS_ENRICH_ONLY", "") not in ("", "0", "false", "False")
+# 补写所有集群的 -workflow 记录的 extend_env_comments；不 watch pod、不采集容量
+# （避免与成员集群 collector 产生重复记录：Karmada 分发后 CP 面和成员集群的
+# Pod UID 不同）。
+ER_CROSS_ENRICH_ONLY = os.environ.get("ER_CROSS_ENRICH_ONLY", "").strip().lower() not in ("", "0", "false", "no", "off")
 
 # 集群卡数快照：采集/对齐粒度（秒），默认 5 分钟；snapshot_time 对齐到其整数倍
 CAPACITY_INTERVAL = int(os.environ.get("CAPACITY_INTERVAL", "300"))
@@ -1624,24 +1625,25 @@ def _sync_ephemeral_runners():
         return
 
     runner_map = {}
+    er_lower_bounds = {}  # (ns, name) -> 时间窗口下界（仅 ER_CROSS_ENRICH_ONLY 用）
     for item in runners.get("items", []):
         name = item.get("metadata", {}).get("name", "")
         ns = item.get("metadata", {}).get("namespace", "")
-        if name:
-            info = _er_to_info(item)
-            # Karmada CP 跨写需要时间窗口下界（防 runner 名复用撞旧记录）
+        if not name:
+            continue
+        runner_map[(ns, name)] = _er_to_info(item)
+        if ER_CROSS_ENRICH_ONLY:
             creation = item.get("metadata", {}).get("creationTimestamp", "")
             if creation:
                 try:
                     dt = datetime.fromisoformat(creation.replace("Z", "+00:00"))
-                    info["_creation"] = (dt - timedelta(hours=1)).isoformat()
+                    er_lower_bounds[(ns, name)] = (dt - timedelta(hours=1)).isoformat()
                 except (ValueError, TypeError):
                     pass
-            runner_map[(ns, name)] = info
 
     # ── ER 跨集群补写模式（Karmada CP）：只做跨写，跳过 Part A/B ──
     if ER_CROSS_ENRICH_ONLY:
-        _cross_enrich_workflow_pods(runner_map)
+        _cross_enrich_workflow_pods(runner_map, er_lower_bounds)
         return
 
     # ── Part A：本集群 active/provisioning -workflow 记录 ──
@@ -2027,28 +2029,27 @@ def _sync_worker_pods():
     _put_conn(conn)
 
 
-def _cross_enrich_workflow_pods(runner_map: dict):
+def _cross_enrich_workflow_pods(runner_map: dict, lower_bounds: dict):
     """ER 跨集群补写（Karmada CP 场景）：把本面查到的 EphemeralRunner 信息，
-    按 runner 名补写到所有集群的 -workflow 记录。
+    按 (namespace, runner 名) 补写到所有集群的 -workflow 记录。
 
     与 Liqo 的 _sync_remote_workflow_pods（Part B）互补：
     - Liqo 场景：ER 在本集群、job pod 在远端 → 找虚拟节点上的 runner pod 触发
     - Karmada 场景：ER 在 CP 面、job pod 在成员集群 → 直接用全量 runner_map
 
     SQL 复用 Part B：按 name 匹配 + 时间窗口（runner 创建-1h）+ IS DISTINCT FROM 去重。
+    额外加 _namespace 过滤（不同 ns 下同名 runner 不会互相串写）。
     """
     if not runner_map:
         return
 
-    info_list = []  # (info_json, wf_name, lower_bound, info_json)
+    info_list = []  # (info_json, wf_name, wf_ns, lower_bound, info_json)
     for (ns, runner_name), info in runner_map.items():
         if not info:
-            continue
-        # 时间窗口下界：用 ER 的 creationTimestamp（可能缺失，缺失则不限）
-        lower = info.pop("_creation", "")
-        # 写入 DB 的 JSON 不含内部字段（_creation 已 pop 掉）
+            continue  # 空 info 不覆盖已补写的数据
+        lower = lower_bounds.get((ns, runner_name), "")
         info_json = json.dumps(info, ensure_ascii=False)
-        info_list.append((info_json, runner_name + "-workflow", lower, info_json))
+        info_list.append((info_json, runner_name + "-workflow", ns, lower, info_json))
 
     if not info_list:
         return
@@ -2059,12 +2060,15 @@ def _cross_enrich_workflow_pods(runner_map: dict):
             cur.executemany(
                 "UPDATE pod_history SET extend_env_comments = %s "
                 "WHERE name = %s "
+                "AND _namespace = %s "
                 "AND (created_at = '' OR created_at >= %s) "
                 "AND COALESCE(extend_env_comments, '{}') IS DISTINCT FROM %s",
                 info_list,
             )
+            updated = cur.rowcount
         conn.commit()
-        log.info(f"[ER跨写] karmada-cp 为 {len(info_list)} 个 -workflow pod 补写工作流信息")
+        if updated > 0:
+            log.info(f"[ER跨写] {CLUSTER_ID or 'karmada-cp'} 补写 {updated} 条 -workflow 记录")
     except Exception as e:
         log.warning(f"[ER跨写] 补写失败: {e}")
         _put_conn(conn, error=True)
@@ -2519,9 +2523,11 @@ if __name__ == "__main__":
     if ER_CROSS_ENRICH_ONLY:
         # Karmada CP ER 跨写模式：不 watch pod / 不采集容量（避免与成员集群
         # collector 的记录重复），只周期性查本面 ER 并跨写 -workflow 记录。
+        # 不启动 cleanup（全局 DELETE 不按 cluster 过滤，保留期由 api/standalone 管）。
+        if MODE not in ("collector", "standalone"):
+            log.warning(f"ER_CROSS_ENRICH_ONLY 模式建议 MODE=collector，当前 MODE={MODE}")
         log.info("ER 跨集群补写模式（Karmada CP），仅同步 EphemeralRunner …")
         threading.Thread(target=_runner_sync_loop, daemon=True, name="runner-sync").start()
-        threading.Thread(target=_cleanup_loop, daemon=True, name="cleanup").start()
         threading.Event().wait()
 
     if MODE in ("collector", "standalone"):
