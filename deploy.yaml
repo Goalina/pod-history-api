@@ -1058,10 +1058,6 @@ spec:
         - name: huawei-swr-image-pull-secret-model-gy
       nodeSelector:
         kubernetes.io/arch: amd64
-      # sidecar 创建 tun 设备与路由需要
-      securityContext:
-        capabilities:
-          add: ["NET_ADMIN"]
       containers:
         # OpenVPN sidecar：建 VPN 隧道到华为云内网（10.0.254.0/24）
         - name: vpn
