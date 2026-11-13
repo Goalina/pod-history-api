@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -2525,7 +2526,9 @@ if __name__ == "__main__":
         # collector 的记录重复），只周期性查本面 ER 并跨写 -workflow 记录。
         # 不启动 cleanup（全局 DELETE 不按 cluster 过滤，保留期由 api/standalone 管）。
         if MODE not in ("collector", "standalone"):
-            log.warning(f"ER_CROSS_ENRICH_ONLY 模式建议 MODE=collector，当前 MODE={MODE}")
+            log.error(f"ER_CROSS_ENRICH_ONLY 需要 MODE=collector/standalone（当前 {MODE}），"
+                      "否则 k8s 客户端不会初始化，线程将空转")
+            sys.exit(1)
         log.info("ER 跨集群补写模式（Karmada CP），仅同步 EphemeralRunner …")
         threading.Thread(target=_runner_sync_loop, daemon=True, name="runner-sync").start()
         threading.Event().wait()
