@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0
 ## [Unreleased]
 
 ### Added
+- 新增 `sz-lab` 集群 collector（华为云内网生产集群，VPN 接入）：Pod 内 OpenVPN sidecar（`openvpn-sidecar:1.0`，过滤 `10.0.0.0/22` 推送路由避免与 Pod CIDR 冲突，仅走 `10.0.254.0/24`）+ collector（kubeconfig 由 Vault 注入，server 指向内网 `https://10.0.254.194:6443`）。前置：Secret `szlab-vpn-config`（VPN 配置+认证，已创建）+ Vault `internal/data/ascend/npu-exporter` 下 `szlab` key（内网版 kubeconfig）
 - 新增 `source=buildkite`：识别 Buildkite（`agent-stack-k8s`）拉起的 CI Pod（判据：`buildkite.com/job-uuid` label 或 `buildkite.com/pipeline-slug` annotation，如 vllm-project 的 `vllm-omni-npu-ci`），从 Pod annotation/label 提取构建元数据写入 `extend_env_comments`：`pipeline_slug`/`build_url`/`build_number`（从 build-url 的 `/builds/<n>` 解析）/`build_branch`/`repository_url`（完整 git URL，与 atomgit 的 `repository_url` 语义一致）/`job_url`/`job_priority`/`job_uuid`/`controller_id`/`queue`/`resource_class`，无需额外 K8s API 调用。复用现有接口与字段，不新增路由/列
 - 主路由 `GET /api/v1/envs/history` 新增可选 `source` 查询参数（如 `?source=buildkite`），按来源在 SQL 层过滤（复用 `idx_source` 索引），不传则返回全部来源（行为不变）；避免调用方只能拉全量后自行过滤
 - AtomGit CI 的 `extend_env_comments` 新增 `pr_number`、`pr_head_sha` 两个字段，分别取自 Pod annotation `octopus.io/pc-pr-number`、`octopus.io/pc-pr-head-sha`

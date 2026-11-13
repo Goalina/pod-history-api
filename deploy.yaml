@@ -1015,6 +1015,132 @@ spec:
                   path: token
 
 ---
+# ── Collector: sz-lab (生产集群，需 VPN，OpenVPN sidecar + Vault kubeconfig) ──
+# 前置条件：
+#   1) Vault internal/data/ascend/npu-exporter 下已有 szlab key（内网版 kubeconfig，
+#      server 指向 https://10.0.254.194:6443）
+#   2) Secret szlab-vpn-config 已创建（含 client.conf / auth.txt），
+#      client.conf 过滤了 10.0.0.0/22 路由（避免与 Pod CIDR 冲突），仅走 10.0.254.0/24
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-history-collector-sz-lab
+  namespace: arc-history
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-history-collector-sz-lab
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-inject-perms-szlab.yaml: "0400"
+        vault.hashicorp.com/agent-inject-secret-szlab.yaml: internal/data/ascend/npu-exporter
+        vault.hashicorp.com/agent-inject-template-szlab.yaml: |
+          {{- with secret "internal/data/ascend/npu-exporter" -}}
+          {{ .Data.data.szlab }}
+          {{- end }}
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+        vault.hashicorp.com/role: pod-history-api
+        vault.hashicorp.com/tls-skip-verify: "true"
+      labels:
+        app: pod-history-collector-sz-lab
+    spec:
+      serviceAccountName: pod-history-api
+      imagePullSecrets:
+        - name: huawei-swr-image-pull-secret-model-gy
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      # sidecar 创建 tun 设备与路由需要
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN"]
+      containers:
+        # OpenVPN sidecar：建 VPN 隧道到华为云内网（10.0.254.0/24）
+        - name: vpn
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/openvpn-sidecar:1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: vpn-config
+              mountPath: /vpn
+              readOnly: true
+            - name: tun-device
+              mountPath: /dev/net/tun
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "ip link show tun0 2>/dev/null || exit 1"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+        - name: collector
+          image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/pod-history-api:20261031-0940
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "collector"
+            - name: CLUSTER_ID
+              value: "sz-lab"
+            - name: KUBECONFIG_PATH
+              value: "/vault/secrets/szlab.yaml"
+            - name: RETENTION_DAYS
+              value: "30"
+            - name: DATABASE_URL
+              value: "postgresql://pod_history@pod-history-postgres:5432/pod_history"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          # 等待 VPN 隧道就绪再启动（否则 k8s 客户端连接会超时重试）
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "waiting for VPN (tun0) ..."
+              i=0
+              until ip link show tun0 >/dev/null 2>&1 || [ $i -ge 60 ]; do
+                sleep 5; i=$((i+1))
+              done
+              if ! ip link show tun0 >/dev/null 2>&1; then
+                echo "WARNING: tun0 not ready after 300s, starting anyway"
+              fi
+              echo "starting collector"
+              exec python3 server.py
+      volumes:
+        - name: token-vol
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api
+                  expirationSeconds: 600
+                  path: token
+        - name: vpn-config
+          secret:
+            secretName: szlab-vpn-config
+        - name: tun-device
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+
+---
 # ── API Server Service ─────────────────────────────────────
 apiVersion: v1
 kind: Service
